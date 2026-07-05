@@ -143,6 +143,30 @@ curl -N http://localhost:3002/v1/chat/completions \
 
 请求体配置优先于请求头，请求头优先于环境变量。
 
+## Roo Code 接入
+
+Roo Code 使用 OpenAI Compatible 提供商连接本服务：
+
+| Roo Code 配置 | 值 |
+| --- | --- |
+| API Provider | `OpenAI Compatible` |
+| Base URL | `http://127.0.0.1:3002/v1` |
+| API Key | 任意非空字符串，例如 `local` |
+| Model ID | `gpt-5.5` |
+
+在 Roo Code 的 Custom Headers 中增加：
+
+| Header | 值 |
+| --- | --- |
+| `X-Codex-Client` | `roo-code` |
+| `X-Codex-Sandbox` | `workspace-write` |
+
+代理会从 Roo Code 随请求发送的 `environment_details` 中自动识别 VS Code 工作区，因此一般不需要设置 `X-Codex-Workdir`。这也避免了中文路径放入 HTTP Header 后导致请求无法发出。如果客户端没有发送工作区信息，可以额外设置 `X-Codex-Workdir`，但包含中文或其他非 ASCII 字符时必须先进行 URL 编码。
+
+服务会根据 Roo Code 的系统提示、`ask_followup_question` 工具或 `X-Codex-Client: roo-code` 请求头自动识别 Roo 请求。Codex 的内部文本/XML结果会被代理转换成标准 OpenAI `tool_calls`：需要用户选择时调用 `ask_followup_question`，任务结束时调用 `attempt_completion`。Roo 因而可以正常显示问题、建议选项和完成结果；用户回答后，Roo 会把完整对话放进下一轮请求继续处理。如果调用方另外提供 `conversation_id`，代理也会用 Codex 原生会话续接。
+
+当前 Codex CLI 仍在服务端内部执行文件、命令和 MCP 工具，因此 Roo 只负责对话与追问界面，不会接管这些工具的逐项审批。
+
 ## 图片输入
 
 CLI 模式支持 OpenAI 风格的 base64 图片内容：
@@ -167,6 +191,25 @@ CLI 模式支持 OpenAI 风格的 base64 图片内容：
 ```
 
 图片会写入系统临时目录，请求结束后自动清理。目前不下载远程图片 URL。
+
+## 浏览器自动化
+
+代理子会话使用独立的 Playwright MCP 执行浏览器任务。由于 LaunchAgent 启动的 `codex exec` 无法访问 Codex Desktop 会话中的 `iab` 实例，代理会为子会话禁用内置 Browser 插件和 `node_repl` MCP，避免 Agent 错误尝试连接 `iab`。
+
+Playwright MCP 需要在 Codex CLI 全局配置中启用：
+
+```bash
+codex mcp add playwright -- \
+  npx -y @playwright/mcp@latest --browser chrome --isolated
+```
+
+这里不使用 `--headless`，因此执行浏览器任务时会打开用户可见的 Chrome 窗口。
+
+可以用以下命令确认状态：
+
+```bash
+codex mcp list
+```
 
 ## LaunchAgent 管理（macOS）
 

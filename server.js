@@ -27,6 +27,12 @@ const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 600000;
 const SSE_HEARTBEAT_INTERVAL = parseInt(process.env.SSE_HEARTBEAT_INTERVAL) || 15000;
 // 同时运行的 codex 子进程上限，超出的请求排队等待，避免重试风暴堆积进程
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 3;
+// 代理子会话无法访问 Codex Desktop 的 iab 实例。禁用内置 Browser 插件及其
+// node_repl MCP，避免 Agent 误选 iab；浏览器任务统一交给独立 Playwright MCP。
+const PROXY_BROWSER_CONFIG = [
+  '-c', 'plugins."browser@openai-bundled".enabled=false',
+  '-c', 'mcp_servers.node_repl.enabled=false',
+];
 
 if (!SANDBOX_MODES.includes(CODEX_SANDBOX)) {
   console.error(`Error: CODEX_SANDBOX must be one of: ${SANDBOX_MODES.join(', ')}`);
@@ -38,6 +44,22 @@ if (!USE_WEB_INTERFACE && !USE_CLI && !OPENAI_API_KEY) {
   process.exit(1);
 }
 
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  const requestId = `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  let finished = false;
+  res.setHeader('X-Request-Id', requestId);
+  res.on('finish', () => {
+    finished = true;
+    console.log(`[${requestId}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - startedAt}ms`);
+  });
+  res.on('close', () => {
+    if (!finished) {
+      console.warn(`[${requestId}] ${req.method} ${req.originalUrl} client-closed ${Date.now() - startedAt}ms`);
+    }
+  });
+  next();
+});
 app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '100mb' }));
@@ -125,6 +147,108 @@ function contentToString(content) {
   return String(content || '');
 }
 
+function isRooCodeRequest(req, messages, tools) {
+  const clientHint = String(req.headers['x-codex-client'] || req.headers['user-agent'] || '').toLowerCase();
+  if (clientHint.includes('roo')) return true;
+
+  const systemText = (Array.isArray(messages) ? messages : [])
+    .filter(message => message.role === 'system')
+    .map(message => contentToString(message.content))
+    .join('\n')
+    .toLowerCase();
+  if (systemText.includes('roo code') || systemText.includes('ask_followup_question')) return true;
+
+  return Array.isArray(tools) && tools.some(tool => {
+    const name = tool?.function?.name || tool?.name || '';
+    return String(name).toLowerCase() === 'ask_followup_question';
+  });
+}
+
+function decodeWorkdirHeader(value) {
+  if (!value) return '';
+  try {
+    return decodeURIComponent(String(value));
+  } catch (e) {
+    return String(value);
+  }
+}
+
+function inferRooWorkdir(messages) {
+  const text = (Array.isArray(messages) ? messages : [])
+    .map(message => contentToString(message.content))
+    .join('\n');
+
+  const patterns = [
+    /<cwd>([^<]+)<\/cwd>/i,
+    /Current (?:Working|Workspace) Directory\s*\(([^)\n]+)\)/i,
+    /(?:cwd|working directory)\s*[:：]\s*([^\n<]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return match[1]
+        .trim()
+        .replace(/&apos;/gi, "'")
+        .replace(/&quot;/gi, '"')
+        .replace(/^[\s'"`]+|[\s'"`]+$/g, '');
+    }
+  }
+  return '';
+}
+
+const ROO_CODE_INTERACTION_PROMPT = `
+You are serving a Roo Code client. When essential information is missing and the user must choose or clarify, do not guess and do not use an internal user-input tool. End the turn with exactly one Roo Code ask_followup_question XML block, without Markdown fences or explanatory text:
+<ask_followup_question>
+<question>Write the concise question here</question>
+<follow_up>
+<suggest>First concrete option</suggest>
+<suggest>Second concrete option</suggest>
+</follow_up>
+</ask_followup_question>
+Use two to four useful suggestions. Only use this block when an answer is genuinely required; otherwise complete the task normally.`;
+
+function decodeXmlText(value) {
+  return String(value || '')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .trim();
+}
+
+function createRooToolCall(content) {
+  const text = String(content || '').trim();
+  const askMatch = text.match(/<ask_followup_question>[\s\S]*?<question>([\s\S]*?)<\/question>[\s\S]*?<follow_up>([\s\S]*?)<\/follow_up>[\s\S]*?<\/ask_followup_question>/i);
+
+  let name;
+  let args;
+  if (askMatch) {
+    const suggestions = [...askMatch[2].matchAll(/<suggest>([\s\S]*?)<\/suggest>/gi)]
+      .map(match => decodeXmlText(match[1]))
+      .filter(Boolean);
+    name = 'ask_followup_question';
+    args = {
+      question: decodeXmlText(askMatch[1]),
+      follow_up: suggestions.map(text => ({ text, mode: null })),
+    };
+  } else {
+    const completionMatch = text.match(/<attempt_completion>[\s\S]*?<result>([\s\S]*?)<\/result>[\s\S]*?<\/attempt_completion>/i);
+    name = 'attempt_completion';
+    args = { result: decodeXmlText(completionMatch ? completionMatch[1] : text) };
+  }
+
+  return {
+    id: `call-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    type: 'function',
+    function: {
+      name,
+      arguments: JSON.stringify(args),
+    },
+  };
+}
+
 function buildPrompt(messages, images) {
   let prompt = '';
   let imageIndex = 0;
@@ -158,6 +282,8 @@ function buildPrompt(messages, images) {
       prompt += `Human: ${msgContent}\n\n`;
     } else if (msg.role === 'assistant') {
       prompt += `Assistant: ${msgContent}\n\n`;
+    } else if (msg.role === 'tool') {
+      prompt += `Human: Tool result${msg.name ? ` (${msg.name})` : ''}: ${msgContent}\n\n`;
     }
   }
 
@@ -256,11 +382,23 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { messages, model, stream = false, temperature, max_tokens, tools, conversation_id, sandbox, workdir } = req.body;
 
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
+        error: {
+          message: 'messages must be a non-empty array',
+          type: 'invalid_request_error',
+        },
+      });
+    }
+
     const cliModel = mapModel(model);
+    const rooCodeRequest = isRooCodeRequest(req, messages, tools);
 
     // 沙箱模式与工作目录：请求体 > 请求头 > 环境变量默认值
     const requestSandbox = sandbox || req.headers['x-codex-sandbox'] || CODEX_SANDBOX;
-    const requestWorkdir = workdir || req.headers['x-codex-workdir'] || CODEX_WORKDIR;
+    const headerWorkdir = decodeWorkdirHeader(req.headers['x-codex-workdir']);
+    const inferredWorkdir = rooCodeRequest ? inferRooWorkdir(messages) : '';
+    const requestWorkdir = workdir || headerWorkdir || inferredWorkdir || CODEX_WORKDIR;
 
     if (!SANDBOX_MODES.includes(requestSandbox)) {
       return res.status(400).json({
@@ -299,16 +437,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { images, tempDir } = extractAndSaveImages(promptMessages);
 
     if (USE_CLI) {
-      const systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
-      const conversationMessages = promptMessages.filter(m => m.role === 'user' || m.role === 'assistant');
+      let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
+      if (rooCodeRequest) {
+        systemPrompt = [systemPrompt, ROO_CODE_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
+      }
+      const conversationMessages = promptMessages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool');
       let prompt = buildPrompt(conversationMessages, images);
+      if (rooCodeRequest) {
+        prompt = `${ROO_CODE_INTERACTION_PROMPT}\n\n${prompt}`;
+      }
 
       // 续接已有会话时用 `exec resume <thread_id>`（不支持 --ephemeral/--sandbox/--cd，
       // 沙箱模式改用 -c sandbox_mode 覆盖，工作目录沿用会话创建时的值）；
       // 否则走一次新的 `exec`，如果带了 conversation_id 就不加 --ephemeral，以便之后可以 resume。
       const args = resumeThreadId
-        ? ['exec', 'resume', resumeThreadId, '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '-c', `sandbox_mode=${JSON.stringify(requestSandbox)}`]
-        : ['exec', ...(conversation_id ? [] : ['--ephemeral']), '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox];
+        ? ['exec', 'resume', resumeThreadId, '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '-c', `sandbox_mode=${JSON.stringify(requestSandbox)}`, ...PROXY_BROWSER_CONFIG]
+        : ['exec', ...(conversation_id ? [] : ['--ephemeral']), '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox, ...PROXY_BROWSER_CONFIG];
 
       if (!resumeThreadId && requestWorkdir) {
         args.push('--cd', requestWorkdir);
@@ -399,7 +543,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (text) {
                   const chunk = fullText ? '\n\n' + text : text;
                   fullText += chunk;
-                  sendChunk(chunk);
+                  if (!rooCodeRequest) sendChunk(chunk);
                 }
               }
 
@@ -469,6 +613,20 @@ app.post('/v1/chat/completions', async (req, res) => {
               // 避免 resume 后把 Codex 刚生成的内容再次作为输入发送回去。
               saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
             }
+            const rooToolCall = rooCodeRequest ? createRooToolCall(fullText) : null;
+            if (rooToolCall) {
+              writeSSE(res, JSON.stringify({
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created: createdTime,
+                model: cliModel,
+                choices: [{
+                  index: 0,
+                  delta: { tool_calls: [{ index: 0, ...rooToolCall }] },
+                  finish_reason: null,
+                }],
+              }));
+            }
             const finalChunk = {
               id: chatId,
               object: 'chat.completion.chunk',
@@ -478,7 +636,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 {
                   index: 0,
                   delta: {},
-                  finish_reason: 'stop',
+                  finish_reason: rooToolCall ? 'tool_calls' : 'stop',
                 },
               ],
               usage: {
@@ -615,6 +773,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
           }
 
+          const rooToolCall = rooCodeRequest ? createRooToolCall(fullText) : null;
           const openAIResponse = {
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
@@ -625,9 +784,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                 index: 0,
                 message: {
                   role: 'assistant',
-                  content: fullText,
+                  content: rooToolCall ? null : fullText,
+                  ...(rooToolCall ? { tool_calls: [rooToolCall] } : {}),
                 },
-                finish_reason: 'stop',
+                finish_reason: rooToolCall ? 'tool_calls' : 'stop',
               },
             ],
             usage: {
