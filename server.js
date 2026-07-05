@@ -7,7 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-// conversation_id -> { threadId, sentCount, lastUpdated }
+const { EventEmitter } = require('events');
+
 const conversationSessions = new Map();
 const CONTEXT_EXPIRE_TIME = parseInt(process.env.CONTEXT_EXPIRE_TIME) || 3600000;
 
@@ -17,22 +18,16 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'codex-latest';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_WEB_INTERFACE = process.env.USE_WEB_INTERFACE === 'true';
 const USE_CLI = process.env.USE_CLI === 'true';
-// 沙箱模式：read-only（只读）| workspace-write（可写工作区）| danger-full-access（无限制）
+const USE_APP_SERVER = process.env.USE_APP_SERVER === 'true' || USE_CLI;
+
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 const CODEX_SANDBOX = process.env.CODEX_SANDBOX || 'danger-full-access';
-// Codex 的工作目录（-C 参数），不设置则使用代理进程自身的 cwd
 const CODEX_WORKDIR = process.env.CODEX_WORKDIR || '';
-// 子进程超时时间（毫秒），默认10分钟：agent 任务经常要读文件/跑命令，比单纯问答耗时更久
 const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 600000;
 const SSE_HEARTBEAT_INTERVAL = parseInt(process.env.SSE_HEARTBEAT_INTERVAL) || 15000;
-// 同时运行的 codex 子进程上限，超出的请求排队等待，避免重试风暴堆积进程
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 3;
-// 代理子会话无法访问 Codex Desktop 的 iab 实例。禁用内置 Browser 插件及其
-// node_repl MCP，避免 Agent 误选 iab；浏览器任务统一交给独立 Playwright MCP。
-const PROXY_BROWSER_CONFIG = [
-  '-c', 'plugins."browser@openai-bundled".enabled=false',
-  '-c', 'mcp_servers.node_repl.enabled=false',
-];
+const PROXY_BROWSER_CONFIG = [];
+const APPROVAL_POLICY = process.env.APPROVAL_POLICY || 'never';
 
 if (!SANDBOX_MODES.includes(CODEX_SANDBOX)) {
   console.error(`Error: CODEX_SANDBOX must be one of: ${SANDBOX_MODES.join(', ')}`);
@@ -43,6 +38,193 @@ if (!USE_WEB_INTERFACE && !USE_CLI && !OPENAI_API_KEY) {
   console.error('Error: Either OPENAI_API_KEY is required, or USE_WEB_INTERFACE=true, or USE_CLI=true must be set in .env file');
   process.exit(1);
 }
+
+class AppServerClient extends EventEmitter {
+  constructor() {
+    super();
+    this.child = null;
+    this.buffer = '';
+    this.requestId = 0;
+    this.pendingRequests = new Map();
+    this.initialized = false;
+    this.initPromise = null;
+    this.stderr = '';
+    this.activeTurns = new Set();
+  }
+
+  async start() {
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this._doInit();
+    return this.initPromise;
+  }
+
+  async _doInit() {
+    const args = ['app-server', '--stdio', ...PROXY_BROWSER_CONFIG];
+    const env = { ...process.env };
+    if (!env.CODEX_HOME) {
+      const stateDir = path.join(os.tmpdir(), 'codex-proxy-state');
+      if (!fs.existsSync(stateDir)) {
+        fs.mkdirSync(stateDir, { recursive: true });
+      }
+      const authSrc = path.join(process.env.HOME || os.homedir(), '.codex', 'auth.json');
+      const authDst = path.join(stateDir, 'auth.json');
+      if (fs.existsSync(authSrc) && !fs.existsSync(authDst)) {
+        try {
+          fs.copyFileSync(authSrc, authDst);
+        } catch (e) {
+          console.warn('Failed to copy auth.json:', e.message);
+        }
+      }
+      const configSrc = path.join(process.env.HOME || os.homedir(), '.codex', 'config.toml');
+      const configDst = path.join(stateDir, 'config.toml');
+      if (fs.existsSync(configSrc) && !fs.existsSync(configDst)) {
+        try {
+          fs.copyFileSync(configSrc, configDst);
+        } catch (e) {
+          console.warn('Failed to copy config.toml:', e.message);
+        }
+      }
+      env.CODEX_HOME = stateDir;
+    }
+    this.child = spawn('codex', args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+    });
+
+    this.child.stdout.on('data', (data) => {
+      this.buffer += data.toString();
+      const lines = this.buffer.split('\n');
+      this.buffer = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const msg = JSON.parse(trimmed);
+          this._handleMessage(msg);
+        } catch (e) {
+          console.warn('Failed to parse app-server message:', trimmed.slice(0, 200));
+        }
+      }
+    });
+
+    this.child.stderr.on('data', (data) => {
+      this.stderr += data.toString();
+    });
+
+    this.child.on('error', (err) => {
+      console.error('App Server process error:', err.message);
+      this._rejectAllPending(err);
+      this.initialized = false;
+      this.initPromise = null;
+    });
+
+    this.child.on('close', (code, signal) => {
+      console.warn(`App Server process exited - code: ${code}, signal: ${signal}`);
+      if (this.stderr) {
+        console.warn('App Server stderr (last 500 chars):', this.stderr.slice(-500));
+      }
+      this._rejectAllPending(new Error(`App Server exited: code=${code}, signal=${signal}`));
+      this.initialized = false;
+      this.initPromise = null;
+    });
+
+    const initResult = await this.request('initialize', {
+      clientInfo: { name: 'codex-proxy', version: '1.0.0' },
+      capabilities: { experimentalApi: true },
+    });
+
+    this.notify('initialized', {});
+    this.initialized = true;
+    console.log('App Server initialized:', initResult.userAgent);
+    return initResult;
+  }
+
+  _handleMessage(msg) {
+    if (msg.id !== undefined) {
+      const pending = this.pendingRequests.get(msg.id);
+      if (pending) {
+        this.pendingRequests.delete(msg.id);
+        if (msg.error) {
+          pending.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        } else {
+          pending.resolve(msg.result);
+        }
+      } else if (msg.method) {
+        this.emit('serverRequest', msg.id, msg.method, msg.params || {});
+      }
+    } else {
+      if (msg.method) {
+        this.emit('notification', msg.method, msg.params || {});
+        if (msg.method !== 'error') {
+          this.emit(msg.method, msg.params || {});
+        } else {
+          console.warn('App Server error notification:', msg.params?.error?.message || JSON.stringify(msg.params).slice(0, 200));
+        }
+      }
+    }
+  }
+
+  request(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const id = ++this.requestId;
+      this.pendingRequests.set(id, { resolve, reject, method });
+      this.child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+    });
+  }
+
+  notify(method, params = {}) {
+    this.child.stdin.write(JSON.stringify({ method, params }) + '\n');
+  }
+
+  respond(id, result) {
+    this.child.stdin.write(JSON.stringify({ id, result }) + '\n');
+  }
+
+  _rejectAllPending(err) {
+    for (const [id, pending] of this.pendingRequests) {
+      pending.reject(err);
+    }
+    this.pendingRequests.clear();
+  }
+
+  async threadStart({ model, cwd, sandbox, ephemeral = false }) {
+    const params = { model, cwd, sandbox, ephemeral };
+    const result = await this.request('thread/start', params);
+    return result.thread;
+  }
+
+  async threadResume(threadId) {
+    const result = await this.request('thread/resume', { threadId });
+    return result.thread;
+  }
+
+  async turnStart({ threadId, input, model }) {
+    const params = { threadId, input };
+    if (model) params.model = model;
+    const result = await this.request('turn/start', params);
+    return result.turn;
+  }
+
+  async turnInterrupt(threadId) {
+    try {
+      await this.request('turn/interrupt', { threadId });
+    } catch (e) {
+    }
+  }
+
+  shutdown() {
+    if (this.child) {
+      this.child.kill('SIGTERM');
+      setTimeout(() => {
+        if (this.child && !this.child.killed) {
+          this.child.kill('SIGKILL');
+        }
+      }, 5000);
+    }
+  }
+}
+
+const appServer = USE_APP_SERVER && USE_CLI ? new AppServerClient() : null;
 
 app.use((req, res, next) => {
   const startedAt = Date.now();
@@ -61,7 +243,12 @@ app.use((req, res, next) => {
   next();
 });
 app.use(cors());
-app.use(compression());
+app.use(compression({
+  filter: (req, res) => {
+    if (res.getHeader('Content-Type') === 'text/event-stream') return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -70,8 +257,10 @@ function setupSSE(res) {
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
-  // compression 会缓冲较小的 SSE 数据块，导致客户端看起来一直没有响应。
   res.setHeader('Content-Encoding', 'identity');
+  if (typeof res.compress === 'function') {
+    res.compress = false;
+  }
   res.flushHeaders();
 }
 
@@ -112,22 +301,37 @@ function releaseCodexSlot() {
 }
 
 const AVAILABLE_MODELS = [
-  { id: 'gpt-5.5', object: 'model', created: 1718000000, owned_by: 'openai' },
-  { id: 'gpt-5.4', object: 'model', created: 1718000000, owned_by: 'openai' },
-  { id: 'gpt-5.4-mini', object: 'model', created: 1718000000, owned_by: 'openai' },
-  { id: 'gpt-5', object: 'model', created: 1718000000, owned_by: 'openai' },
+  { id: 'my-gpt-5.5', object: 'model', created: 1718000000, owned_by: 'openai' },
+  { id: 'my-gpt-5.4', object: 'model', created: 1718000000, owned_by: 'openai' },
+  { id: 'my-gpt-5.4-mini', object: 'model', created: 1718000000, owned_by: 'openai' },
+  { id: 'my-gpt-5', object: 'model', created: 1718000000, owned_by: 'openai' },
 ];
 
 function mapModel(model) {
   const modelMap = {
     'codex-latest': 'gpt-5.5',
     'codex-base': 'gpt-5.4',
+    'my-gpt-5.5': 'gpt-5.5',
+    'my-gpt-5.4': 'gpt-5.4',
+    'my-gpt-5.4-mini': 'gpt-5.4-mini',
+    'my-gpt-5': 'gpt-5',
     'gpt-5.5': 'gpt-5.5',
     'gpt-5.4': 'gpt-5.4',
     'gpt-5.4-mini': 'gpt-5.4-mini',
     'gpt-5': 'gpt-5',
   };
   return modelMap[model] || model || 'gpt-5.5';
+}
+
+function displayModel(internalModel, requestModel) {
+  if (requestModel && requestModel.startsWith('my-')) return requestModel;
+  const displayMap = {
+    'gpt-5.5': 'my-gpt-5.5',
+    'gpt-5.4': 'my-gpt-5.4',
+    'gpt-5.4-mini': 'my-gpt-5.4-mini',
+    'gpt-5': 'my-gpt-5',
+  };
+  return displayMap[internalModel] || internalModel;
 }
 
 function contentToString(content) {
@@ -389,6 +593,44 @@ function buildPrompt(messages, images) {
   return prompt;
 }
 
+function messagesToAppServerInput(messages, images, userOnly = false) {
+  const input = [];
+  let imageIndex = 0;
+
+  for (const msg of messages) {
+    if (msg.role === 'system') continue;
+    if (userOnly && msg.role !== 'user') continue;
+
+    const textContent = contentToString(msg.content);
+    let msgText = textContent;
+
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      const imageParts = msg.content.filter(p => p.type === 'image_url');
+      if (imageParts.length > 0) {
+        const imgDescs = [];
+        for (let i = 0; i < imageParts.length; i++) {
+          const img = images[imageIndex];
+          if (img) {
+            imgDescs.push(`[图片 ${imageIndex + 1}: ${img.description || '用户上传的图片'}]`);
+            imageIndex++;
+          }
+        }
+        if (imgDescs.length > 0) {
+          msgText = msgText + '\n\n' + imgDescs.join('\n');
+        }
+      }
+    }
+
+    if (msg.role === 'user') {
+      input.push({ type: 'text', text: msgText });
+    } else if (msg.role === 'tool') {
+      input.push({ type: 'text', text: `Tool result${msg.name ? ` (${msg.name})` : ''}: ${msgText}` });
+    }
+  }
+
+  return input;
+}
+
 function extractAndSaveImages(messages) {
   const images = [];
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-proxy-'));
@@ -478,7 +720,7 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { messages, model, stream = false, temperature, max_tokens, tools, conversation_id, sandbox, workdir } = req.body;
+    const { messages, model, stream = true, temperature, max_tokens, tools, conversation_id, sandbox, workdir } = req.body;
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
@@ -496,10 +738,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     const interactiveToolAnswered = hasAnsweredInteractiveTool(messages, interactiveTool);
     if (interactiveTool) {
       const toolName = interactiveTool?.function?.name || interactiveTool?.name;
-      console.log(`[interactive-tool] ${toolName} answered=${interactiveToolAnswered} schema=${JSON.stringify(interactiveTool?.function?.parameters || interactiveTool?.input_schema || interactiveTool?.parameters || {})}`);
+      console.log(`[interactive-tool] ${toolName} answered=${interactiveToolAnswered}`);
     }
 
-    // 沙箱模式与工作目录：请求体 > 请求头 > 环境变量默认值
     const requestSandbox = sandbox || req.headers['x-codex-sandbox'] || CODEX_SANDBOX;
     const headerWorkdir = decodeWorkdirHeader(req.headers['x-codex-workdir']);
     const inferredWorkdir = rooCodeRequest ? inferRooWorkdir(messages) : '';
@@ -522,10 +763,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         },
       });
     }
-    
-    // conversation_id 用真实的 codex 会话（thread）续接，而不是在内存里攒完整历史再整段重发：
-    // 客户端（如大多数 OpenAI 兼容前端）每轮都会带上完整消息数组，这里只把上次会话之后
-    // 新增的消息发给 codex，历史由 codex 自己的 session 文件保存。
+
     const conversationSession = conversation_id ? getConversationSession(conversation_id) : null;
     const resumeThreadId = conversationSession ? conversationSession.threadId : null;
     const promptMessages = conversationSession ? messages.slice(conversationSession.sentCount) : messages;
@@ -541,367 +779,214 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const { images, tempDir } = extractAndSaveImages(promptMessages);
 
-    if (USE_CLI) {
-      let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
-      if (interactiveClientRequest) {
-        systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
-      }
-      const conversationMessages = promptMessages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool');
-      let prompt = buildPrompt(conversationMessages, images);
-      if (interactiveClientRequest) {
-        prompt = `${CLIENT_INTERACTION_PROMPT}\n\n${prompt}`;
-      }
+    if (USE_CLI && appServer) {
+      await appServer.start();
+      await acquireCodexSlot();
 
-      // 续接已有会话时用 `exec resume <thread_id>`（不支持 --ephemeral/--sandbox/--cd，
-      // 沙箱模式改用 -c sandbox_mode 覆盖，工作目录沿用会话创建时的值）；
-      // 否则走一次新的 `exec`，如果带了 conversation_id 就不加 --ephemeral，以便之后可以 resume。
-      const args = resumeThreadId
-        ? ['exec', 'resume', resumeThreadId, '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '-c', `sandbox_mode=${JSON.stringify(requestSandbox)}`, ...PROXY_BROWSER_CONFIG]
-        : ['exec', ...(conversation_id ? [] : ['--ephemeral']), '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox, ...PROXY_BROWSER_CONFIG];
+      let threadId = null;
+      let turnCompleted = false;
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let fullText = '';
+      let timedOut = false;
+      const chatId = 'chatcmpl-' + Date.now();
+      const createdTime = Math.floor(Date.now() / 1000);
+      let resolveTurn = null;
 
-      if (!resumeThreadId && requestWorkdir) {
-        args.push('--cd', requestWorkdir);
-      }
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        console.error('Turn timed out');
+        if (threadId) appServer.turnInterrupt(threadId);
+        if (resolveTurn) resolveTurn();
+      }, PROCESS_TIMEOUT);
 
-      if (images.length > 0) {
-        // codex exec resume 的 --image 只接受单个文件，多图场景下只带第一张，避免 CLI 报错
-        const imagesToAttach = resumeThreadId ? images.slice(0, 1) : images;
-        for (const img of imagesToAttach) {
-          args.push('--image', img.path);
+      function sendChunk(content) {
+        if (!content || !stream) return;
+        const chunk = {
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: createdTime,
+          model: displayModel(cliModel, model),
+          choices: [
+            {
+              index: 0,
+              delta: { content: content },
+              finish_reason: null,
+            },
+          ],
+        };
+        writeSSE(res, JSON.stringify(chunk));
+        // 强制刷新缓冲区
+        if (res.socket && res.socket.write) {
+          res.socket.uncork();
         }
       }
 
-      if (systemPrompt) {
-        args.push('-c', `system_prompt=${JSON.stringify(systemPrompt)}`);
+      function onNotification(method, params) {
+        if (params.threadId && threadId && params.threadId !== threadId) return;
+
+        if (method === 'item/agentMessage/delta' && params.delta) {
+          fullText += params.delta;
+          // 如果没有交互工具，或者交互工具已经回答过，就立即流式发送
+          // 否则等待完整内容，以便正确解析工具调用
+          if (!interactiveClientRequest || interactiveToolAnswered) {
+            sendChunk(params.delta);
+          }
+        }
+
+        if (method === 'item/completed' && params.item && params.item.type === 'agentMessage') {
+          const text = params.item.text || '';
+          if (text && text.length > fullText.length) {
+            const remaining = text.slice(fullText.length);
+            if (remaining) {
+              fullText = text;
+              // 如果没有交互工具，或者交互工具已经回答过，就发送剩余内容
+              if (!interactiveClientRequest || interactiveToolAnswered) {
+                sendChunk(remaining);
+              }
+            }
+          }
+          fullText = text;
+        }
+
+        if (method === 'thread/tokenUsage/updated' && params.tokenUsage) {
+          const usage = params.tokenUsage.last || params.tokenUsage.total || {};
+          promptTokens = usage.inputTokens || 0;
+          completionTokens = usage.outputTokens || 0;
+        }
+
+        if (method === 'turn/completed') {
+          turnCompleted = true;
+          if (resolveTurn) resolveTurn();
+        }
       }
-      
+
+      function onServerRequest(id, method, params) {
+        if (params.threadId && threadId && params.threadId !== threadId) return;
+
+        if (method.includes('/requestApproval') || method.includes('/approval')) {
+          if (APPROVAL_POLICY === 'never' || requestSandbox === 'danger-full-access') {
+            appServer.respond(id, { decision: 'accept' });
+          } else {
+            appServer.respond(id, { decision: 'cancel' });
+          }
+        } else {
+          try { appServer.respond(id, {}); } catch (e) {}
+        }
+      }
+
+      appServer.on('notification', onNotification);
+      appServer.on('serverRequest', onServerRequest);
+
+      const waitForTurn = () => new Promise((resolve) => {
+        resolveTurn = resolve;
+      });
+
       if (stream) {
         setupSSE(res);
         const heartbeat = startSSEHeartbeat(res);
-        await acquireCodexSlot();
 
-        const child = spawn('codex', args, {
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
+        // 发送初始 role chunk（OpenAI 标准格式）
+        writeSSE(res, JSON.stringify({
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created: createdTime,
+          model: displayModel(cliModel, model),
+          choices: [{
+            index: 0,
+            delta: { role: 'assistant' },
+            finish_reason: null,
+          }],
+        }));
 
-        let buffer = '';
-        let fullText = '';
-        let promptTokens = 0;
-        let completionTokens = 0;
-        let stderr = '';
-        let isClosed = false;
-        let spawnError = null;
-        let timedOut = false;
-        let capturedThreadId = null;
-        const chatId = 'chatcmpl-' + Date.now();
-        const createdTime = Math.floor(Date.now() / 1000);
-        
-        const timeout = setTimeout(() => {
-          if (!isClosed) {
-            timedOut = true;
-            console.error('CLI process timed out');
-            child.kill('SIGTERM');
-            setTimeout(() => {
-              if (!isClosed) child.kill('SIGKILL');
-            }, 5000);
-          }
-        }, PROCESS_TIMEOUT);
-        
-        function sendChunk(content) {
-          if (!content) return;
-          const chunk = {
-            id: chatId,
-            object: 'chat.completion.chunk',
-            created: createdTime,
-            model: cliModel,
-            choices: [
-              {
-                index: 0,
-                delta: { content: content },
-                finish_reason: null,
-              },
-            ],
-          };
-          writeSSE(res, JSON.stringify(chunk));
-        }
-        
-        function parseBuffer() {
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            try {
-              const parsed = JSON.parse(trimmed);
-              const type = parsed.type || '';
-
-              if (type === 'thread.started' && parsed.thread_id) {
-                capturedThreadId = parsed.thread_id;
-              }
-
-              if (type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
-                // codex 一个回合可能产生多条独立的 agent_message（先说明步骤，再给结论），
-                // 每条都是完整文本而非累积增量，所以按消息追加，不能按长度差做字符切片
-                const text = parsed.item.text || '';
-                if (text) {
-                  const chunk = fullText ? '\n\n' + text : text;
-                  fullText += chunk;
-                  if (!interactiveClientRequest) sendChunk(chunk);
-                }
-              }
-
-              if (type === 'turn.completed' && parsed.usage) {
-                promptTokens = parsed.usage.input_tokens || 0;
-                completionTokens = parsed.usage.output_tokens || 0;
-              }
-            } catch (e) {
-            }
-          }
-        }
-        
-        child.stdout.on('data', (data) => {
-          buffer += data.toString();
-          parseBuffer();
-        });
-        
-        child.stderr.on('data', (data) => {
-          stderr += data.toString();
-        });
-
-        child.on('error', (error) => {
-          spawnError = error;
-          stderr += error.message;
-        });
-        
-        let resClosed = false;
         res.on('close', () => {
-          resClosed = true;
-          if (!isClosed) {
-            child.kill('SIGTERM');
+          if (threadId && !turnCompleted) {
+            appServer.turnInterrupt(threadId);
           }
+          if (resolveTurn) resolveTurn();
         });
-        
-        child.on('close', (code, signal) => {
-          isClosed = true;
-          clearTimeout(timeout);
-          clearInterval(heartbeat);
-          cleanupTempDir(tempDir);
-          releaseCodexSlot();
 
-          if (buffer.trim()) {
-            buffer += '\n';
-            parseBuffer();
+        try {
+          if (resumeThreadId) {
+            threadId = resumeThreadId;
+            await appServer.threadResume(threadId);
+          } else {
+            const thread = await appServer.threadStart({
+              model: cliModel,
+              cwd: requestWorkdir || process.cwd(),
+              sandbox: requestSandbox,
+              ephemeral: !conversation_id,
+            });
+            threadId = thread.id;
           }
-          
+
+          let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
+          if (interactiveClientRequest) {
+            systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
+          }
+
+          const input = [];
+          if (systemPrompt) {
+            input.push({ type: 'text', text: systemPrompt });
+          }
+          const userInput = messagesToAppServerInput(promptMessages, images, !!resumeThreadId);
+          input.push(...userInput);
+
+          await appServer.turnStart({ threadId, input, model: cliModel });
+
+          await waitForTurn();
+
           if (res.writableEnded) return;
-          
-          const exitedNormally = code === 0 && !signal;
-          const wasKilledByClient = resClosed && (signal === 'SIGTERM' || signal === 'SIGKILL');
-          
-          if (spawnError || timedOut || (!exitedNormally && !wasKilledByClient)) {
-            console.error('CLI stream error - code:', code, 'signal:', signal, 'stderr:', stderr.slice(-1000));
+
+          if (timedOut) {
             const errorChunk = {
               error: {
-                message: timedOut
-                  ? `CLI process timed out after ${PROCESS_TIMEOUT}ms`
-                  : stderr || `CLI process exited with code ${code}, signal ${signal}`,
+                message: `Request timed out after ${PROCESS_TIMEOUT}ms`,
                 type: 'api_error',
               },
             };
             writeSSE(res, JSON.stringify(errorChunk));
             res.end();
-          } else {
-            if (conversation_id) {
-              // 下一轮客户端的完整 messages 通常会包含本轮助手回复，计数时一并跳过，
-              // 避免 resume 后把 Codex 刚生成的内容再次作为输入发送回去。
-              saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
-            }
-            const rooToolCall = interactiveClientRequest
-              ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
-              : null;
-            const safeToolCall = rooToolCall;
-            if (interactiveClientRequest && !safeToolCall && fullText) {
-              sendChunk(fullText);
-            }
-            if (safeToolCall) {
-              writeSSE(res, JSON.stringify({
-                id: chatId,
-                object: 'chat.completion.chunk',
-                created: createdTime,
-                model: cliModel,
-                choices: [{
-                  index: 0,
-                  delta: { tool_calls: [{ index: 0, ...safeToolCall }] },
-                  finish_reason: null,
-                }],
-              }));
-            }
-            const finalChunk = {
-              id: chatId,
-              object: 'chat.completion.chunk',
-              created: createdTime,
-              model: cliModel,
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: safeToolCall ? 'tool_calls' : 'stop',
-                },
-              ],
-              usage: {
-                prompt_tokens: promptTokens,
-                completion_tokens: completionTokens,
-                total_tokens: promptTokens + completionTokens,
-              },
-            };
-            writeSSE(res, JSON.stringify(finalChunk));
-            writeSSE(res, '[DONE]');
-            res.end();
-          }
-        });
-        
-        child.stdin.write(prompt);
-        child.stdin.end();
-        
-      } else {
-        await acquireCodexSlot();
-        const child = spawn('codex', args, {
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-
-        let buffer = '';
-        let fullText = '';
-        let promptTokens = 0;
-        let completionTokens = 0;
-        let stderr = '';
-        let isClosed = false;
-        let responded = false;
-        let spawnError = null;
-        let timedOut = false;
-        let capturedThreadId = null;
-        
-        const timeout = setTimeout(() => {
-          if (!isClosed) {
-            timedOut = true;
-            console.error('CLI process timed out');
-            child.kill('SIGTERM');
-            setTimeout(() => {
-              if (!isClosed) child.kill('SIGKILL');
-            }, 5000);
-          }
-        }, PROCESS_TIMEOUT);
-        
-        function parseBuffer() {
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            
-            try {
-              const parsed = JSON.parse(trimmed);
-
-              if (parsed.type === 'thread.started' && parsed.thread_id) {
-                capturedThreadId = parsed.thread_id;
-              }
-
-              if (parsed.type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
-                // 一个回合可能包含多条独立的 agent_message，逐条追加而不是覆盖
-                const text = parsed.item.text || '';
-                if (text) {
-                  fullText = fullText ? fullText + '\n\n' + text : text;
-                }
-              }
-
-              if (parsed.type === 'turn.completed' && parsed.usage) {
-                promptTokens = parsed.usage.input_tokens || 0;
-                completionTokens = parsed.usage.output_tokens || 0;
-              }
-            } catch (e) {
-            }
-          }
-        }
-
-        child.stdout.on('data', (data) => {
-          buffer += data.toString();
-          parseBuffer();
-        });
-
-        child.stderr.on('data', (data) => {
-          stderr += data.toString();
-        });
-
-        child.on('error', (error) => {
-          spawnError = error;
-          stderr += error.message;
-        });
-
-        let resClosed = false;
-        res.on('close', () => {
-          resClosed = true;
-          if (!isClosed) {
-            child.kill('SIGTERM');
-          }
-        });
-
-        child.stdin.write(prompt);
-        child.stdin.end();
-
-        child.on('close', (code, signal) => {
-          isClosed = true;
-          clearTimeout(timeout);
-          cleanupTempDir(tempDir);
-          releaseCodexSlot();
-
-          if (responded) return;
-          responded = true;
-          
-          if (buffer.trim()) {
-            buffer += '\n';
-            parseBuffer();
-          }
-          
-          const exitedNormally = code === 0 && !signal;
-          const wasKilledByUs = resClosed && (signal === 'SIGTERM' || signal === 'SIGKILL');
-          
-          if (spawnError || timedOut || (!exitedNormally && !wasKilledByUs && fullText === '')) {
-            console.error('CLI error - code:', code, 'signal:', signal, 'stderr:', stderr.slice(-1000));
-            return res.status(500).json({
-              error: {
-                message: timedOut
-                  ? `CLI process timed out after ${PROCESS_TIMEOUT}ms`
-                  : stderr || `CLI exited with code ${code}, signal ${signal}`,
-                type: 'api_error',
-              },
-            });
+            return;
           }
 
           if (conversation_id) {
-            // 下一轮客户端的完整 messages 通常会包含本轮助手回复。
-            saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
+            saveConversationSession(conversation_id, threadId, messages.length + 1);
           }
 
           const rooToolCall = interactiveClientRequest
             ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
             : null;
-          const safeToolCall = rooToolCall;
-          const openAIResponse = {
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: cliModel,
+
+          // 如果有交互工具但没有工具调用，发送完整文本（因为之前没有流式发送）
+          if (interactiveClientRequest && !interactiveToolAnswered && !rooToolCall && fullText) {
+            sendChunk(fullText);
+          }
+
+          if (rooToolCall) {
+            writeSSE(res, JSON.stringify({
+              id: chatId,
+              object: 'chat.completion.chunk',
+              created: createdTime,
+              model: displayModel(cliModel, model),
+              choices: [{
+                index: 0,
+                delta: { tool_calls: [{ index: 0, ...rooToolCall }] },
+                finish_reason: null,
+              }],
+            }));
+          }
+
+          const finalChunk = {
+            id: chatId,
+            object: 'chat.completion.chunk',
+            created: createdTime,
+            model: displayModel(cliModel, model),
             choices: [
               {
                 index: 0,
-                message: {
-                  role: 'assistant',
-                  content: safeToolCall ? null : fullText,
-                  ...(safeToolCall ? { tool_calls: [safeToolCall] } : {}),
-                },
-                finish_reason: safeToolCall ? 'tool_calls' : 'stop',
+                delta: {},
+                finish_reason: rooToolCall ? 'tool_calls' : 'stop',
               },
             ],
             usage: {
@@ -910,14 +995,123 @@ app.post('/v1/chat/completions', async (req, res) => {
               total_tokens: promptTokens + completionTokens,
             },
           };
-          
+          writeSSE(res, JSON.stringify(finalChunk));
+          writeSSE(res, '[DONE]');
+          res.end();
+        } catch (err) {
+          console.error('App Server stream error:', err.message);
+          if (!res.writableEnded) {
+            const errorChunk = {
+              error: {
+                message: err.message || 'Internal server error',
+                type: 'api_error',
+              },
+            };
+            writeSSE(res, JSON.stringify(errorChunk));
+            res.end();
+          }
+        } finally {
+          clearTimeout(timeout);
+          clearInterval(heartbeat);
+          appServer.removeListener('notification', onNotification);
+          appServer.removeListener('serverRequest', onServerRequest);
+          cleanupTempDir(tempDir);
+          releaseCodexSlot();
+        }
+      } else {
+        try {
+          if (resumeThreadId) {
+            threadId = resumeThreadId;
+            await appServer.threadResume(threadId);
+          } else {
+            const thread = await appServer.threadStart({
+              model: cliModel,
+              cwd: requestWorkdir || process.cwd(),
+              sandbox: requestSandbox,
+              ephemeral: !conversation_id,
+            });
+            threadId = thread.id;
+          }
+
+          let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
+          if (interactiveClientRequest) {
+            systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
+          }
+
+          const input = [];
+          if (systemPrompt) {
+            input.push({ type: 'text', text: systemPrompt });
+          }
+          const userInput = messagesToAppServerInput(promptMessages, images, !!resumeThreadId);
+          input.push(...userInput);
+
+          await appServer.turnStart({ threadId, input, model: cliModel });
+
+          await waitForTurn();
+
+          if (timedOut) {
+            return res.status(500).json({
+              error: {
+                message: `Request timed out after ${PROCESS_TIMEOUT}ms`,
+                type: 'api_error',
+              },
+            });
+          }
+
+          if (conversation_id) {
+            saveConversationSession(conversation_id, threadId, messages.length + 1);
+          }
+
+          const rooToolCall = interactiveClientRequest
+            ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
+            : null;
+
+          const openAIResponse = {
+            id: chatId,
+            object: 'chat.completion',
+            created: createdTime,
+            model: displayModel(cliModel, model),
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: rooToolCall ? null : fullText,
+                  ...(rooToolCall ? { tool_calls: [rooToolCall] } : {}),
+                },
+                finish_reason: rooToolCall ? 'tool_calls' : 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+            },
+          };
+
           res.json(openAIResponse);
-        });
+        } catch (err) {
+          console.error('App Server error:', err.message);
+          if (!res.writableEnded) {
+            res.status(500).json({
+              error: {
+                message: err.message || 'Internal server error',
+                type: 'api_error',
+              },
+            });
+          }
+        } finally {
+          clearTimeout(timeout);
+          appServer.removeListener('notification', onNotification);
+          appServer.removeListener('serverRequest', onServerRequest);
+          cleanupTempDir(tempDir);
+          releaseCodexSlot();
+        }
       }
-      
+
       return;
     }
-    
+
     if (USE_WEB_INTERFACE) {
       const replyText = '这是来自网页版的响应，需要进一步实现具体逻辑。';
       
@@ -931,7 +1125,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
-            model: cliModel,
+            model: displayModel(cliModel, model),
             choices: [
               {
                 index: 0,
@@ -947,7 +1141,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           id: 'chatcmpl-' + Date.now(),
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
-          model: cliModel,
+          model: displayModel(cliModel, model),
           choices: [
             {
               index: 0,
@@ -969,7 +1163,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           id: 'chatcmpl-' + Date.now(),
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
-          model: cliModel,
+          model: displayModel(cliModel, model),
           choices: [
             {
               index: 0,
@@ -991,9 +1185,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       cleanupTempDir(tempDir);
       return;
     }
-    
+
     const requestBody = {
-      model: cliModel,
+      model: displayModel(cliModel, model),
       messages: messages,
       temperature: temperature,
       max_tokens: max_tokens,
@@ -1051,15 +1245,35 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     message: 'Codex proxy server is running',
-    default_model: DEFAULT_MODEL,
+    default_model: displayModel(mapModel(DEFAULT_MODEL)),
     available_models: AVAILABLE_MODELS.map(model => model.id),
     sandbox: CODEX_SANDBOX,
     workdir: CODEX_WORKDIR || process.cwd(),
+    app_server: USE_APP_SERVER && appServer ? appServer.initialized : false,
+    active_processes: activeCodexProcesses,
+    queued_requests: codexWaitQueue.length,
   });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Codex proxy server running on http://localhost:${PORT}`);
   console.log(`Default model: ${DEFAULT_MODEL}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  if (USE_APP_SERVER && appServer) {
+    console.log('App Server mode: enabled (lazy initialized on first request)');
+  }
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down...');
+  if (appServer) appServer.shutdown();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down...');
+  if (appServer) appServer.shutdown();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000);
 });
