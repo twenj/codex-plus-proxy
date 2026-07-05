@@ -139,6 +139,12 @@ function contentToString(content) {
       .map(part => {
         if (typeof part === 'string') return part;
         if (part.type === 'text' && typeof part.text === 'string') return part.text;
+        if (part.type === 'tool_result' || part.type === 'tool_response') {
+          return contentToString(part.content ?? part.output ?? part.result);
+        }
+        if (typeof part.content === 'string') return part.content;
+        if (typeof part.output === 'string') return part.output;
+        if (typeof part.result === 'string') return part.result;
         return '';
       })
       .filter(Boolean)
@@ -162,6 +168,77 @@ function isRooCodeRequest(req, messages, tools) {
     const name = tool?.function?.name || tool?.name || '';
     return String(name).toLowerCase() === 'ask_followup_question';
   });
+}
+
+function findInteractiveTool(tools) {
+  if (!Array.isArray(tools)) return null;
+  const exactNames = [
+    'request_user_input',
+    'ask_user_question',
+    'ask_questions',
+    'ask_question',
+    'ask_followup_question',
+    'AskUserQuestion',
+  ];
+  for (const name of exactNames) {
+    const match = tools.find(tool => String(tool?.function?.name || tool?.name || '').toLowerCase() === name.toLowerCase());
+    if (match) return match;
+  }
+  return tools.find(tool => /(?:ask|question|feedback|user_input)/i.test(tool?.function?.name || tool?.name || '')) || null;
+}
+
+function buildOptionValue(schema, text, index) {
+  if (!schema || schema.type === 'string') return text;
+  const properties = schema.properties || {};
+  const result = {};
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (/^(?:label|title|text|name|value)$/i.test(key)) result[key] = text;
+    else if (/^(?:description|detail|subtitle)$/i.test(key)) result[key] = text;
+    else if (/^(?:id|key)$/i.test(key)) result[key] = `option_${index + 1}`;
+    else if (propertySchema?.type === 'string' && (schema.required || []).includes(key)) result[key] = text;
+    else if (propertySchema?.type === 'boolean' && (schema.required || []).includes(key)) result[key] = false;
+    else if ((schema.required || []).includes(key)) result[key] = null;
+  }
+  return result;
+}
+
+function buildInteractiveArguments(tool, question, suggestions) {
+  const parameters = tool?.function?.parameters || tool?.input_schema || tool?.parameters || {};
+  const properties = parameters.properties || {};
+  const args = {};
+
+  const buildOptions = propertySchema => {
+    const itemSchema = propertySchema?.items || { type: 'string' };
+    return suggestions.map((text, index) => buildOptionValue(itemSchema, text, index));
+  };
+
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (/^(?:question|prompt|message)$/i.test(key)) {
+      args[key] = question;
+    } else if (/^(?:title|header)$/i.test(key)) {
+      args[key] = '提问';
+    } else if (/^(?:options|choices|suggestions|follow_up)$/i.test(key) && propertySchema?.type === 'array') {
+      args[key] = buildOptions(propertySchema);
+    } else if (/^questions$/i.test(key) && propertySchema?.type === 'array') {
+      const itemSchema = propertySchema.items || {};
+      const item = {};
+      for (const [itemKey, itemProperty] of Object.entries(itemSchema.properties || {})) {
+        if (/^(?:question|prompt|message)$/i.test(itemKey)) item[itemKey] = question;
+        else if (/^(?:title|header)$/i.test(itemKey)) item[itemKey] = '提问';
+        else if (/^(?:options|choices|suggestions)$/i.test(itemKey) && itemProperty?.type === 'array') {
+          item[itemKey] = buildOptions(itemProperty);
+        } else if ((itemSchema.required || []).includes(itemKey)) {
+          item[itemKey] = itemProperty?.type === 'boolean' ? false : question;
+        }
+      }
+      args[key] = [item];
+    } else if ((parameters.required || []).includes(key)) {
+      if (propertySchema?.type === 'boolean') args[key] = false;
+      else if (propertySchema?.type === 'array') args[key] = [];
+      else args[key] = question;
+    }
+  }
+  return args;
 }
 
 function decodeWorkdirHeader(value) {
@@ -197,8 +274,8 @@ function inferRooWorkdir(messages) {
   return '';
 }
 
-const ROO_CODE_INTERACTION_PROMPT = `
-You are serving a Roo Code client. When essential information is missing and the user must choose or clarify, do not guess and do not use an internal user-input tool. End the turn with exactly one Roo Code ask_followup_question XML block, without Markdown fences or explanatory text:
+const CLIENT_INTERACTION_PROMPT = `
+You are serving an IDE client that supports a native interactive-question card. When essential information is missing and the user must choose or clarify, do not guess and do not use an internal user-input tool. End the turn with exactly one ask_followup_question XML block, without Markdown fences or explanatory text:
 <ask_followup_question>
 <question>Write the concise question here</question>
 <follow_up>
@@ -218,7 +295,7 @@ function decodeXmlText(value) {
     .trim();
 }
 
-function createRooToolCall(content) {
+function createClientToolCall(content, rooCodeRequest, interactiveTool) {
   const text = String(content || '').trim();
   const askMatch = text.match(/<ask_followup_question>[\s\S]*?<question>([\s\S]*?)<\/question>[\s\S]*?<follow_up>([\s\S]*?)<\/follow_up>[\s\S]*?<\/ask_followup_question>/i);
 
@@ -228,15 +305,17 @@ function createRooToolCall(content) {
     const suggestions = [...askMatch[2].matchAll(/<suggest>([\s\S]*?)<\/suggest>/gi)]
       .map(match => decodeXmlText(match[1]))
       .filter(Boolean);
-    name = 'ask_followup_question';
-    args = {
-      question: decodeXmlText(askMatch[1]),
-      follow_up: suggestions.map(text => ({ text, mode: null })),
-    };
-  } else {
+    const question = decodeXmlText(askMatch[1]);
+    name = interactiveTool?.function?.name || interactiveTool?.name || 'ask_followup_question';
+    args = interactiveTool
+      ? buildInteractiveArguments(interactiveTool, question, suggestions)
+      : { question, follow_up: suggestions.map(text => ({ text, mode: null })) };
+  } else if (rooCodeRequest) {
     const completionMatch = text.match(/<attempt_completion>[\s\S]*?<result>([\s\S]*?)<\/result>[\s\S]*?<\/attempt_completion>/i);
     name = 'attempt_completion';
     args = { result: decodeXmlText(completionMatch ? completionMatch[1] : text) };
+  } else {
+    return null;
   }
 
   return {
@@ -247,6 +326,25 @@ function createRooToolCall(content) {
       arguments: JSON.stringify(args),
     },
   };
+}
+
+function hasAnsweredInteractiveTool(messages, interactiveTool) {
+  const toolName = String(interactiveTool?.function?.name || interactiveTool?.name || '').toLowerCase();
+  if (!toolName || !Array.isArray(messages)) return false;
+  const recentMessages = messages.slice(-8);
+  const matchingCallIds = new Set();
+  for (const message of recentMessages) {
+    for (const call of message?.tool_calls || []) {
+      if (String(call?.function?.name || '').toLowerCase() === toolName && call?.id) {
+        matchingCallIds.add(call.id);
+      }
+    }
+  }
+  return recentMessages.some(message => {
+    if (message?.role !== 'tool') return false;
+    const responseName = String(message.name || '').toLowerCase();
+    return responseName === toolName || (message.tool_call_id && matchingCallIds.has(message.tool_call_id));
+  });
 }
 
 function buildPrompt(messages, images) {
@@ -393,6 +491,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const cliModel = mapModel(model);
     const rooCodeRequest = isRooCodeRequest(req, messages, tools);
+    const interactiveTool = findInteractiveTool(tools);
+    const interactiveClientRequest = rooCodeRequest || Boolean(interactiveTool);
+    const interactiveToolAnswered = hasAnsweredInteractiveTool(messages, interactiveTool);
+    if (interactiveTool) {
+      const toolName = interactiveTool?.function?.name || interactiveTool?.name;
+      console.log(`[interactive-tool] ${toolName} answered=${interactiveToolAnswered} schema=${JSON.stringify(interactiveTool?.function?.parameters || interactiveTool?.input_schema || interactiveTool?.parameters || {})}`);
+    }
 
     // 沙箱模式与工作目录：请求体 > 请求头 > 环境变量默认值
     const requestSandbox = sandbox || req.headers['x-codex-sandbox'] || CODEX_SANDBOX;
@@ -438,13 +543,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (USE_CLI) {
       let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
-      if (rooCodeRequest) {
-        systemPrompt = [systemPrompt, ROO_CODE_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
+      if (interactiveClientRequest) {
+        systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
       }
       const conversationMessages = promptMessages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool');
       let prompt = buildPrompt(conversationMessages, images);
-      if (rooCodeRequest) {
-        prompt = `${ROO_CODE_INTERACTION_PROMPT}\n\n${prompt}`;
+      if (interactiveClientRequest) {
+        prompt = `${CLIENT_INTERACTION_PROMPT}\n\n${prompt}`;
       }
 
       // 续接已有会话时用 `exec resume <thread_id>`（不支持 --ephemeral/--sandbox/--cd，
@@ -543,7 +648,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (text) {
                   const chunk = fullText ? '\n\n' + text : text;
                   fullText += chunk;
-                  if (!rooCodeRequest) sendChunk(chunk);
+                  if (!interactiveClientRequest) sendChunk(chunk);
                 }
               }
 
@@ -613,8 +718,14 @@ app.post('/v1/chat/completions', async (req, res) => {
               // 避免 resume 后把 Codex 刚生成的内容再次作为输入发送回去。
               saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
             }
-            const rooToolCall = rooCodeRequest ? createRooToolCall(fullText) : null;
-            if (rooToolCall) {
+            const rooToolCall = interactiveClientRequest
+              ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
+              : null;
+            const safeToolCall = rooToolCall;
+            if (interactiveClientRequest && !safeToolCall && fullText) {
+              sendChunk(fullText);
+            }
+            if (safeToolCall) {
               writeSSE(res, JSON.stringify({
                 id: chatId,
                 object: 'chat.completion.chunk',
@@ -622,7 +733,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 model: cliModel,
                 choices: [{
                   index: 0,
-                  delta: { tool_calls: [{ index: 0, ...rooToolCall }] },
+                  delta: { tool_calls: [{ index: 0, ...safeToolCall }] },
                   finish_reason: null,
                 }],
               }));
@@ -636,7 +747,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 {
                   index: 0,
                   delta: {},
-                  finish_reason: rooToolCall ? 'tool_calls' : 'stop',
+                  finish_reason: safeToolCall ? 'tool_calls' : 'stop',
                 },
               ],
               usage: {
@@ -773,7 +884,10 @@ app.post('/v1/chat/completions', async (req, res) => {
             saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
           }
 
-          const rooToolCall = rooCodeRequest ? createRooToolCall(fullText) : null;
+          const rooToolCall = interactiveClientRequest
+            ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
+            : null;
+          const safeToolCall = rooToolCall;
           const openAIResponse = {
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
@@ -784,10 +898,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                 index: 0,
                 message: {
                   role: 'assistant',
-                  content: rooToolCall ? null : fullText,
-                  ...(rooToolCall ? { tool_calls: [rooToolCall] } : {}),
+                  content: safeToolCall ? null : fullText,
+                  ...(safeToolCall ? { tool_calls: [safeToolCall] } : {}),
                 },
-                finish_reason: rooToolCall ? 'tool_calls' : 'stop',
+                finish_reason: safeToolCall ? 'tool_calls' : 'stop',
               },
             ],
             usage: {
