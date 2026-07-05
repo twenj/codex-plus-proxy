@@ -1,15 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-// 添加上下文存储
 const conversationContext = new Map();
-// 添加上下文过期时间（默认1小时）
-const CONTEXT_EXPIRE_TIME = process.env.CONTEXT_EXPIRE_TIME || 3600000;
+const CONTEXT_EXPIRE_TIME = parseInt(process.env.CONTEXT_EXPIRE_TIME) || 3600000;
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -17,6 +16,19 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'codex-latest';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_WEB_INTERFACE = process.env.USE_WEB_INTERFACE === 'true';
 const USE_CLI = process.env.USE_CLI === 'true';
+// 沙箱模式：read-only（只读）| workspace-write（可写工作区）| danger-full-access（无限制）
+const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
+const CODEX_SANDBOX = process.env.CODEX_SANDBOX || 'danger-full-access';
+// Codex 的工作目录（-C 参数），不设置则使用代理进程自身的 cwd
+const CODEX_WORKDIR = process.env.CODEX_WORKDIR || '';
+// 子进程超时时间（毫秒），默认5分钟
+const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 120000;
+const SSE_HEARTBEAT_INTERVAL = parseInt(process.env.SSE_HEARTBEAT_INTERVAL) || 15000;
+
+if (!SANDBOX_MODES.includes(CODEX_SANDBOX)) {
+  console.error(`Error: CODEX_SANDBOX must be one of: ${SANDBOX_MODES.join(', ')}`);
+  process.exit(1);
+}
 
 if (!USE_WEB_INTERFACE && !USE_CLI && !OPENAI_API_KEY) {
   console.error('Error: Either OPENAI_API_KEY is required, or USE_WEB_INTERFACE=true, or USE_CLI=true must be set in .env file');
@@ -24,8 +36,35 @@ if (!USE_WEB_INTERFACE && !USE_CLI && !OPENAI_API_KEY) {
 }
 
 app.use(cors());
+app.use(compression());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
+
+function setupSSE(res) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  // compression 会缓冲较小的 SSE 数据块，导致客户端看起来一直没有响应。
+  res.setHeader('Content-Encoding', 'identity');
+  res.flushHeaders();
+}
+
+function writeSSE(res, data) {
+  if (res.writableEnded || res.destroyed) return;
+  res.write(`data: ${data}\n\n`);
+  if (typeof res.flush === 'function') res.flush();
+}
+
+function startSSEHeartbeat(res) {
+  const timer = setInterval(() => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(': heartbeat\n\n');
+    if (typeof res.flush === 'function') res.flush();
+  }, SSE_HEARTBEAT_INTERVAL);
+  timer.unref();
+  return timer;
+}
 
 const AVAILABLE_MODELS = [
   { id: 'gpt-5.5', object: 'model', created: 1718000000, owned_by: 'openai' },
@@ -155,9 +194,6 @@ function saveConversationContext(conversationId, messages) {
     messages: messages,
     lastUpdated: Date.now()
   });
-  
-  // 清理过期上下文
-  cleanupExpiredContext();
 }
 
 function getConversationContext(conversationId) {
@@ -166,7 +202,6 @@ function getConversationContext(conversationId) {
   const context = conversationContext.get(conversationId);
   if (!context) return null;
   
-  // 检查是否过期
   if (Date.now() - context.lastUpdated > CONTEXT_EXPIRE_TIME) {
     conversationContext.delete(conversationId);
     return null;
@@ -184,6 +219,8 @@ function cleanupExpiredContext() {
   }
 }
 
+setInterval(cleanupExpiredContext, Math.max(CONTEXT_EXPIRE_TIME / 2, 60000));
+
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
@@ -193,9 +230,31 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { messages, model, stream = false, temperature, max_tokens, tools, conversation_id } = req.body;
-    
+    const { messages, model, stream = false, temperature, max_tokens, tools, conversation_id, sandbox, workdir } = req.body;
+
     const cliModel = mapModel(model);
+
+    // 沙箱模式与工作目录：请求体 > 请求头 > 环境变量默认值
+    const requestSandbox = sandbox || req.headers['x-codex-sandbox'] || CODEX_SANDBOX;
+    const requestWorkdir = workdir || req.headers['x-codex-workdir'] || CODEX_WORKDIR;
+
+    if (!SANDBOX_MODES.includes(requestSandbox)) {
+      return res.status(400).json({
+        error: {
+          message: `Invalid sandbox mode "${requestSandbox}". Must be one of: ${SANDBOX_MODES.join(', ')}`,
+          type: 'invalid_request_error',
+        },
+      });
+    }
+
+    if (requestWorkdir && !fs.existsSync(requestWorkdir)) {
+      return res.status(400).json({
+        error: {
+          message: `Working directory does not exist: ${requestWorkdir}`,
+          type: 'invalid_request_error',
+        },
+      });
+    }
     
     let fullMessages = messages;
     if (conversation_id) {
@@ -213,8 +272,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       const conversationMessages = fullMessages.filter(m => m.role === 'user' || m.role === 'assistant');
       let prompt = buildPrompt(conversationMessages, images);
       
-      const args = ['exec', '--ephemeral', '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel];
-      
+      const args = ['exec', '--ephemeral', '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox];
+
+      if (requestWorkdir) {
+        args.push('--cd', requestWorkdir);
+      }
+
       if (images.length > 0) {
         for (const img of images) {
           args.push('--image', img.path);
@@ -226,9 +289,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
       
       if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
+        setupSSE(res);
+        const heartbeat = startSSEHeartbeat(res);
         
         const child = spawn('codex', args, {
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -238,10 +300,53 @@ app.post('/v1/chat/completions', async (req, res) => {
         let fullText = '';
         let promptTokens = 0;
         let completionTokens = 0;
-        let responseStarted = false;
+        let stderr = '';
+        let isClosed = false;
+        let spawnError = null;
+        let timedOut = false;
+        const chatId = 'chatcmpl-' + Date.now();
+        const createdTime = Math.floor(Date.now() / 1000);
         
-        child.stdout.on('data', (data) => {
-          buffer += data.toString();
+        const timeout = setTimeout(() => {
+          if (!isClosed) {
+            timedOut = true;
+            console.error('CLI process timed out');
+            child.kill('SIGTERM');
+            setTimeout(() => {
+              if (!isClosed) child.kill('SIGKILL');
+            }, 5000);
+          }
+        }, PROCESS_TIMEOUT);
+        
+        function sendChunk(content) {
+          if (!content) return;
+          const chunk = {
+            id: chatId,
+            object: 'chat.completion.chunk',
+            created: createdTime,
+            model: cliModel,
+            choices: [
+              {
+                index: 0,
+                delta: { content: content },
+                finish_reason: null,
+              },
+            ],
+          };
+          writeSSE(res, JSON.stringify(chunk));
+        }
+        
+        function extractDeltaText(parsed) {
+          if (!parsed) return null;
+          if (parsed.delta && typeof parsed.delta.text === 'string') return parsed.delta.text;
+          if (parsed.item && parsed.item.delta && typeof parsed.item.delta.text === 'string') return parsed.item.delta.text;
+          if (parsed.item && typeof parsed.item.text_delta === 'string') return parsed.item.text_delta;
+          if (typeof parsed.text_delta === 'string') return parsed.text_delta;
+          if (parsed.content && typeof parsed.content.delta === 'string') return parsed.content.delta;
+          return null;
+        }
+        
+        function parseBuffer() {
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
           
@@ -251,30 +356,24 @@ app.post('/v1/chat/completions', async (req, res) => {
             
             try {
               const parsed = JSON.parse(trimmed);
+              const type = parsed.type || '';
               
-              if (parsed.type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
+              const deltaText = extractDeltaText(parsed);
+              if (deltaText) {
+                fullText += deltaText;
+                sendChunk(deltaText);
+              }
+              
+              if (type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
                 const text = parsed.item.text || '';
-                fullText = text;
-                
-                const chunkSize = 10;
-                for (let i = 0; i < text.length; i += chunkSize) {
-                  const chunkText = text.slice(i, i + chunkSize);
-                  const chunk = {
-                    id: 'chatcmpl-' + Date.now(),
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: cliModel,
-                    choices: [
-                      {
-                        index: 0,
-                        delta: { content: chunkText },
-                        finish_reason: null,
-                      },
-                    ],
-                  };
-                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                if (text.length > fullText.length) {
+                  const remaining = text.slice(fullText.length);
+                  if (remaining) {
+                    fullText = text;
+                    sendChunk(remaining);
+                  }
                 }
-                responseStarted = true;
+                fullText = text;
               }
               
               if (parsed.type === 'turn.completed' && parsed.usage) {
@@ -284,28 +383,63 @@ app.post('/v1/chat/completions', async (req, res) => {
             } catch (e) {
             }
           }
+        }
+        
+        child.stdout.on('data', (data) => {
+          buffer += data.toString();
+          parseBuffer();
         });
         
         child.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+
+        child.on('error', (error) => {
+          spawnError = error;
+          stderr += error.message;
         });
         
-        child.on('close', (code) => {
+        let resClosed = false;
+        res.on('close', () => {
+          resClosed = true;
+          if (!isClosed) {
+            child.kill('SIGTERM');
+          }
+        });
+        
+        child.on('close', (code, signal) => {
+          isClosed = true;
+          clearTimeout(timeout);
+          clearInterval(heartbeat);
           cleanupTempDir(tempDir);
-          if (code !== 0 && !res.writableEnded) {
-            console.error(`CLI process exited with code ${code}`);
+          
+          if (buffer.trim()) {
+            buffer += '\n';
+            parseBuffer();
+          }
+          
+          if (res.writableEnded) return;
+          
+          const exitedNormally = code === 0 && !signal;
+          const wasKilledByClient = resClosed && (signal === 'SIGTERM' || signal === 'SIGKILL');
+          
+          if (spawnError || timedOut || (!exitedNormally && !wasKilledByClient)) {
+            console.error('CLI stream error - code:', code, 'signal:', signal, 'stderr:', stderr.slice(-1000));
             const errorChunk = {
               error: {
-                message: `CLI process exited with code ${code}`,
+                message: timedOut
+                  ? `CLI process timed out after ${PROCESS_TIMEOUT}ms`
+                  : stderr || `CLI process exited with code ${code}, signal ${signal}`,
                 type: 'api_error',
               },
             };
-            res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+            writeSSE(res, JSON.stringify(errorChunk));
             res.end();
-          } else if (!res.writableEnded) {
+          } else {
             const finalChunk = {
-              id: 'chatcmpl-' + Date.now(),
+              id: chatId,
               object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
+              created: createdTime,
               model: cliModel,
               choices: [
                 {
@@ -320,8 +454,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                 total_tokens: promptTokens + completionTokens,
               },
             };
-            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-            res.write('data: [DONE]\n\n');
+            writeSSE(res, JSON.stringify(finalChunk));
+            writeSSE(res, '[DONE]');
             res.end();
           }
         });
@@ -339,9 +473,23 @@ app.post('/v1/chat/completions', async (req, res) => {
         let promptTokens = 0;
         let completionTokens = 0;
         let stderr = '';
+        let isClosed = false;
+        let responded = false;
+        let spawnError = null;
+        let timedOut = false;
         
-        child.stdout.on('data', (data) => {
-          buffer += data.toString();
+        const timeout = setTimeout(() => {
+          if (!isClosed) {
+            timedOut = true;
+            console.error('CLI process timed out');
+            child.kill('SIGTERM');
+            setTimeout(() => {
+              if (!isClosed) child.kill('SIGKILL');
+            }, 5000);
+          }
+        }, PROCESS_TIMEOUT);
+        
+        function parseBuffer() {
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
           
@@ -363,22 +511,56 @@ app.post('/v1/chat/completions', async (req, res) => {
             } catch (e) {
             }
           }
+        }
+        
+        child.stdout.on('data', (data) => {
+          buffer += data.toString();
+          parseBuffer();
         });
         
         child.stderr.on('data', (data) => {
           stderr += data.toString();
         });
+
+        child.on('error', (error) => {
+          spawnError = error;
+          stderr += error.message;
+        });
+        
+        let resClosed = false;
+        res.on('close', () => {
+          resClosed = true;
+          if (!isClosed) {
+            child.kill('SIGTERM');
+          }
+        });
         
         child.stdin.write(prompt);
         child.stdin.end();
         
-        child.on('close', (code) => {
+        child.on('close', (code, signal) => {
+          isClosed = true;
+          clearTimeout(timeout);
           cleanupTempDir(tempDir);
-          if (code !== 0) {
-            console.error('CLI exited with code', code, 'stderr:', stderr);
+          
+          if (responded) return;
+          responded = true;
+          
+          if (buffer.trim()) {
+            buffer += '\n';
+            parseBuffer();
+          }
+          
+          const exitedNormally = code === 0 && !signal;
+          const wasKilledByUs = resClosed && (signal === 'SIGTERM' || signal === 'SIGKILL');
+          
+          if (spawnError || timedOut || (!exitedNormally && !wasKilledByUs && fullText === '')) {
+            console.error('CLI error - code:', code, 'signal:', signal, 'stderr:', stderr.slice(-1000));
             return res.status(500).json({
               error: {
-                message: stderr || `CLI exited with code ${code}`,
+                message: timedOut
+                  ? `CLI process timed out after ${PROCESS_TIMEOUT}ms`
+                  : stderr || `CLI exited with code ${code}, signal ${signal}`,
                 type: 'api_error',
               },
             });
@@ -414,33 +596,74 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
     if (USE_WEB_INTERFACE) {
-      const requestBody = {
-        model: cliModel,
-        messages: fullMessages,
-        stream: stream,
-      };
+      const replyText = '这是来自网页版的响应，需要进一步实现具体逻辑。';
       
-      res.json({
-        id: 'chatcmpl-' + Date.now(),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: cliModel,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: '这是来自网页版的响应，需要进一步实现具体逻辑。',
+      if (stream) {
+        setupSSE(res);
+        
+        const chunkSize = 10;
+        for (let i = 0; i < replyText.length; i += chunkSize) {
+          const chunkText = replyText.slice(i, i + chunkSize);
+          const chunk = {
+            id: 'chatcmpl-' + Date.now(),
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: cliModel,
+            choices: [
+              {
+                index: 0,
+                delta: { content: chunkText },
+                finish_reason: null,
+              },
+            ],
+          };
+          writeSSE(res, JSON.stringify(chunk));
+        }
+        
+        const finalChunk = {
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: cliModel,
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
             },
-            finish_reason: 'stop',
+          ],
+          usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
           },
-        ],
-        usage: {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0,
-        },
-      });
+        };
+        writeSSE(res, JSON.stringify(finalChunk));
+        writeSSE(res, '[DONE]');
+        res.end();
+      } else {
+        res.json({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: cliModel,
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: replyText,
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+          },
+        });
+      }
       
       cleanupTempDir(tempDir);
       return;
@@ -507,6 +730,8 @@ app.get('/health', (req, res) => {
     message: 'Codex proxy server is running',
     default_model: DEFAULT_MODEL,
     available_models: AVAILABLE_MODELS.map(model => model.id),
+    sandbox: CODEX_SANDBOX,
+    workdir: CODEX_WORKDIR || process.cwd(),
   });
 });
 
