@@ -465,7 +465,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.end();
           } else {
             if (conversation_id) {
-              saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length);
+              // 下一轮客户端的完整 messages 通常会包含本轮助手回复，计数时一并跳过，
+              // 避免 resume 后把 Codex 刚生成的内容再次作为输入发送回去。
+              saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
             }
             const finalChunk = {
               id: chatId,
@@ -609,7 +611,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
 
           if (conversation_id) {
-            saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length);
+            // 下一轮客户端的完整 messages 通常会包含本轮助手回复。
+            saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length + 1);
           }
 
           const openAIResponse = {
