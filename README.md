@@ -7,7 +7,8 @@
 - 提供 OpenAI 风格的 `/v1/chat/completions` 接口
 - 支持普通响应和 SSE 流式响应
 - 支持文本与 base64 图片输入
-- 支持通过 `conversation_id` 保存短期会话上下文
+- 支持通过 `conversation_id` 续接同一个 codex 会话（基于 `codex exec resume`，只发送增量消息）
+- 限制同时运行的 codex 子进程数量，超出排队等待
 - 支持为 Codex CLI 指定模型、工作目录和沙箱模式
 - 提供模型列表和健康检查接口
 - 支持请求超时、SSE 心跳及客户端断开处理
@@ -34,6 +35,8 @@ npm run dev
 
 服务默认监听 `http://localhost:3002`。
 
+`node_modules/` 和 `.env` 已加入 `.gitignore`，不再提交到仓库；克隆后需要自行 `npm install` 并从 `.env.example` 复制生成 `.env`。包管理器统一用 npm（`package-lock.json`），不再维护 `pnpm-lock.yaml`。
+
 ## 配置
 
 配置文件为 `.env`：
@@ -45,11 +48,12 @@ npm run dev
 | `OPENAI_API_KEY` | 空 | 直连 OpenAI API 时使用的密钥 |
 | `USE_CLI` | `false` | 是否通过本机 Codex CLI 响应请求 |
 | `USE_WEB_INTERFACE` | `false` | 是否使用 Web 占位模式 |
-| `CONTEXT_EXPIRE_TIME` | `3600000` | 内存会话过期时间，单位为毫秒 |
-| `PROCESS_TIMEOUT` | `120000` | Codex CLI 子进程超时，单位为毫秒 |
+| `CONTEXT_EXPIRE_TIME` | `3600000` | `conversation_id` 对应会话的过期时间，单位为毫秒 |
+| `PROCESS_TIMEOUT` | `600000` | Codex CLI 子进程超时，单位为毫秒（agent 任务耗时较长，默认 10 分钟） |
 | `SSE_HEARTBEAT_INTERVAL` | `15000` | SSE 心跳间隔，单位为毫秒 |
 | `CODEX_SANDBOX` | `danger-full-access` | Codex 默认沙箱模式 |
 | `CODEX_WORKDIR` | 空 | Codex CLI 默认工作目录 |
+| `MAX_CONCURRENT_REQUESTS` | `3` | 同时运行的 codex 子进程上限，超出的请求排队等待 |
 
 至少需要满足以下条件之一，否则服务会拒绝启动：
 
@@ -124,9 +128,13 @@ curl -N http://localhost:3002/v1/chat/completions \
 
 | 字段 | 说明 |
 | --- | --- |
-| `conversation_id` | 会话标识；相同标识会复用尚未过期的内存上下文 |
-| `sandbox` | 覆盖本次 Codex CLI 请求的沙箱模式 |
-| `workdir` | 覆盖本次 Codex CLI 请求的工作目录 |
+| `conversation_id` | 会话标识；相同标识会用 `codex exec resume` 续接上一次的 codex 会话，只发送新增的消息，不会重复发送已发过的历史 |
+| `sandbox` | 覆盖本次 Codex CLI 请求的沙箱模式（仅对新建会话生效，续接会话时沙箱通过 `-c sandbox_mode` 覆盖） |
+| `workdir` | 覆盖本次 Codex CLI 请求的工作目录（仅对新建会话生效，续接会话沿用会话创建时的工作目录） |
+
+`conversation_id` 依赖客户端每轮都携带完整的消息数组（大多数 OpenAI 兼容客户端默认如此）。服务端记录"已经发给 codex 的消息条数"，下一轮只截取新增部分发送；如果某一轮消息数组没有变长，会返回 400 错误。
+
+**不同 `conversation_id` 之间互相隔离**：每个 id 对应独立的 codex `thread_id` 和独立的子进程，已通过并发测试验证不会串内容。但**同一个** `conversation_id` 如果被并发发送两次（例如客户端重复提交、网络重试），在第一轮完成前两边都会各自新建一个 codex 会话，最终只有后完成的一个会被记录下来继续使用——不会产生错误答案，但可能出现"这一路对话意外分叉、只留下一条"的现象。正常单客户端顺序对话不会触发，仅在同一 id 出现并发写入时才需要注意。
 
 也可以通过请求头传入：
 
@@ -226,4 +234,4 @@ lsof -nP -iTCP:3002 -sTCP:LISTEN
 
 当前服务默认允许跨域请求，且没有内置接口鉴权，不建议直接暴露到公网。请求还可以覆盖工作目录和沙箱模式；在多人或网络环境中使用时，应在反向代理层增加鉴权、限制来源，并限制允许访问的工作目录和沙箱级别。
 
-会话上下文保存在进程内存中，服务重启后会丢失，也不适合存放敏感信息。
+`conversation_id` 与 codex 会话的映射保存在进程内存中，服务重启后会丢失（对应的 codex 会话仍在磁盘上，只是代理不再记得如何续接）。使用 `conversation_id` 的请求不会加 `--ephemeral`，codex 会把会话记录持久化到本地（通常在 `~/.codex`），不适合处理不希望留存的敏感对话；不带 `conversation_id` 的请求仍然是 `--ephemeral`，不落盘。

@@ -2,12 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
-const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const conversationContext = new Map();
+// conversation_id -> { threadId, sentCount, lastUpdated }
+const conversationSessions = new Map();
 const CONTEXT_EXPIRE_TIME = parseInt(process.env.CONTEXT_EXPIRE_TIME) || 3600000;
 
 const app = express();
@@ -21,9 +22,11 @@ const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 const CODEX_SANDBOX = process.env.CODEX_SANDBOX || 'danger-full-access';
 // Codex 的工作目录（-C 参数），不设置则使用代理进程自身的 cwd
 const CODEX_WORKDIR = process.env.CODEX_WORKDIR || '';
-// 子进程超时时间（毫秒），默认5分钟
-const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 120000;
+// 子进程超时时间（毫秒），默认10分钟：agent 任务经常要读文件/跑命令，比单纯问答耗时更久
+const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 600000;
 const SSE_HEARTBEAT_INTERVAL = parseInt(process.env.SSE_HEARTBEAT_INTERVAL) || 15000;
+// 同时运行的 codex 子进程上限，超出的请求排队等待，避免重试风暴堆积进程
+const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 3;
 
 if (!SANDBOX_MODES.includes(CODEX_SANDBOX)) {
   console.error(`Error: CODEX_SANDBOX must be one of: ${SANDBOX_MODES.join(', ')}`);
@@ -64,6 +67,26 @@ function startSSEHeartbeat(res) {
   }, SSE_HEARTBEAT_INTERVAL);
   timer.unref();
   return timer;
+}
+
+let activeCodexProcesses = 0;
+const codexWaitQueue = [];
+
+function acquireCodexSlot() {
+  if (activeCodexProcesses < MAX_CONCURRENT_REQUESTS) {
+    activeCodexProcesses++;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => codexWaitQueue.push(resolve));
+}
+
+function releaseCodexSlot() {
+  activeCodexProcesses--;
+  const next = codexWaitQueue.shift();
+  if (next) {
+    activeCodexProcesses++;
+    next();
+  }
 }
 
 const AVAILABLE_MODELS = [
@@ -187,39 +210,40 @@ function cleanupTempDir(dir) {
   }
 }
 
-function saveConversationContext(conversationId, messages) {
-  if (!conversationId) return;
-  
-  conversationContext.set(conversationId, {
-    messages: messages,
-    lastUpdated: Date.now()
+function getConversationSession(conversationId) {
+  if (!conversationId) return null;
+
+  const session = conversationSessions.get(conversationId);
+  if (!session) return null;
+
+  if (Date.now() - session.lastUpdated > CONTEXT_EXPIRE_TIME) {
+    conversationSessions.delete(conversationId);
+    return null;
+  }
+
+  return session;
+}
+
+function saveConversationSession(conversationId, threadId, sentCount) {
+  if (!conversationId || !threadId) return;
+
+  conversationSessions.set(conversationId, {
+    threadId,
+    sentCount,
+    lastUpdated: Date.now(),
   });
 }
 
-function getConversationContext(conversationId) {
-  if (!conversationId) return null;
-  
-  const context = conversationContext.get(conversationId);
-  if (!context) return null;
-  
-  if (Date.now() - context.lastUpdated > CONTEXT_EXPIRE_TIME) {
-    conversationContext.delete(conversationId);
-    return null;
-  }
-  
-  return context.messages;
-}
-
-function cleanupExpiredContext() {
+function cleanupExpiredSessions() {
   const now = Date.now();
-  for (const [conversationId, context] of conversationContext) {
-    if (now - context.lastUpdated > CONTEXT_EXPIRE_TIME) {
-      conversationContext.delete(conversationId);
+  for (const [conversationId, session] of conversationSessions) {
+    if (now - session.lastUpdated > CONTEXT_EXPIRE_TIME) {
+      conversationSessions.delete(conversationId);
     }
   }
 }
 
-setInterval(cleanupExpiredContext, Math.max(CONTEXT_EXPIRE_TIME / 2, 60000));
+setInterval(cleanupExpiredSessions, Math.max(CONTEXT_EXPIRE_TIME / 2, 60000)).unref();
 
 app.get('/v1/models', (req, res) => {
   res.json({
@@ -256,46 +280,61 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     }
     
-    let fullMessages = messages;
-    if (conversation_id) {
-      const previousContext = getConversationContext(conversation_id);
-      if (previousContext) {
-        fullMessages = [...previousContext, ...messages];
-      }
-      saveConversationContext(conversation_id, fullMessages);
-    }
-    
-    const { images, tempDir } = extractAndSaveImages(fullMessages);
-    
-    if (USE_CLI) {
-      const systemPrompt = fullMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
-      const conversationMessages = fullMessages.filter(m => m.role === 'user' || m.role === 'assistant');
-      let prompt = buildPrompt(conversationMessages, images);
-      
-      const args = ['exec', '--ephemeral', '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox];
+    // conversation_id 用真实的 codex 会话（thread）续接，而不是在内存里攒完整历史再整段重发：
+    // 客户端（如大多数 OpenAI 兼容前端）每轮都会带上完整消息数组，这里只把上次会话之后
+    // 新增的消息发给 codex，历史由 codex 自己的 session 文件保存。
+    const conversationSession = conversation_id ? getConversationSession(conversation_id) : null;
+    const resumeThreadId = conversationSession ? conversationSession.threadId : null;
+    const promptMessages = conversationSession ? messages.slice(conversationSession.sentCount) : messages;
 
-      if (requestWorkdir) {
+    if (conversationSession && promptMessages.filter(m => m.role === 'user' || m.role === 'assistant').length === 0) {
+      return res.status(400).json({
+        error: {
+          message: 'No new messages for this conversation_id since the last turn.',
+          type: 'invalid_request_error',
+        },
+      });
+    }
+
+    const { images, tempDir } = extractAndSaveImages(promptMessages);
+
+    if (USE_CLI) {
+      const systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
+      const conversationMessages = promptMessages.filter(m => m.role === 'user' || m.role === 'assistant');
+      let prompt = buildPrompt(conversationMessages, images);
+
+      // 续接已有会话时用 `exec resume <thread_id>`（不支持 --ephemeral/--sandbox/--cd，
+      // 沙箱模式改用 -c sandbox_mode 覆盖，工作目录沿用会话创建时的值）；
+      // 否则走一次新的 `exec`，如果带了 conversation_id 就不加 --ephemeral，以便之后可以 resume。
+      const args = resumeThreadId
+        ? ['exec', 'resume', resumeThreadId, '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '-c', `sandbox_mode=${JSON.stringify(requestSandbox)}`]
+        : ['exec', ...(conversation_id ? [] : ['--ephemeral']), '--ignore-rules', '--json', '--skip-git-repo-check', '--model', cliModel, '--sandbox', requestSandbox];
+
+      if (!resumeThreadId && requestWorkdir) {
         args.push('--cd', requestWorkdir);
       }
 
       if (images.length > 0) {
-        for (const img of images) {
+        // codex exec resume 的 --image 只接受单个文件，多图场景下只带第一张，避免 CLI 报错
+        const imagesToAttach = resumeThreadId ? images.slice(0, 1) : images;
+        for (const img of imagesToAttach) {
           args.push('--image', img.path);
         }
       }
-      
+
       if (systemPrompt) {
-        args.push('-c', `system_prompt='${systemPrompt.replace(/'/g, "\\'")}'`);
+        args.push('-c', `system_prompt=${JSON.stringify(systemPrompt)}`);
       }
       
       if (stream) {
         setupSSE(res);
         const heartbeat = startSSEHeartbeat(res);
-        
+        await acquireCodexSlot();
+
         const child = spawn('codex', args, {
           stdio: ['pipe', 'pipe', 'pipe'],
         });
-        
+
         let buffer = '';
         let fullText = '';
         let promptTokens = 0;
@@ -304,6 +343,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         let isClosed = false;
         let spawnError = null;
         let timedOut = false;
+        let capturedThreadId = null;
         const chatId = 'chatcmpl-' + Date.now();
         const createdTime = Math.floor(Date.now() / 1000);
         
@@ -336,47 +376,34 @@ app.post('/v1/chat/completions', async (req, res) => {
           writeSSE(res, JSON.stringify(chunk));
         }
         
-        function extractDeltaText(parsed) {
-          if (!parsed) return null;
-          if (parsed.delta && typeof parsed.delta.text === 'string') return parsed.delta.text;
-          if (parsed.item && parsed.item.delta && typeof parsed.item.delta.text === 'string') return parsed.item.delta.text;
-          if (parsed.item && typeof parsed.item.text_delta === 'string') return parsed.item.text_delta;
-          if (typeof parsed.text_delta === 'string') return parsed.text_delta;
-          if (parsed.content && typeof parsed.content.delta === 'string') return parsed.content.delta;
-          return null;
-        }
-        
         function parseBuffer() {
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
-          
+
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            
+
             try {
               const parsed = JSON.parse(trimmed);
               const type = parsed.type || '';
-              
-              const deltaText = extractDeltaText(parsed);
-              if (deltaText) {
-                fullText += deltaText;
-                sendChunk(deltaText);
+
+              if (type === 'thread.started' && parsed.thread_id) {
+                capturedThreadId = parsed.thread_id;
               }
-              
+
               if (type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
+                // codex 一个回合可能产生多条独立的 agent_message（先说明步骤，再给结论），
+                // 每条都是完整文本而非累积增量，所以按消息追加，不能按长度差做字符切片
                 const text = parsed.item.text || '';
-                if (text.length > fullText.length) {
-                  const remaining = text.slice(fullText.length);
-                  if (remaining) {
-                    fullText = text;
-                    sendChunk(remaining);
-                  }
+                if (text) {
+                  const chunk = fullText ? '\n\n' + text : text;
+                  fullText += chunk;
+                  sendChunk(chunk);
                 }
-                fullText = text;
               }
-              
-              if (parsed.type === 'turn.completed' && parsed.usage) {
+
+              if (type === 'turn.completed' && parsed.usage) {
                 promptTokens = parsed.usage.input_tokens || 0;
                 completionTokens = parsed.usage.output_tokens || 0;
               }
@@ -412,7 +439,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           clearTimeout(timeout);
           clearInterval(heartbeat);
           cleanupTempDir(tempDir);
-          
+          releaseCodexSlot();
+
           if (buffer.trim()) {
             buffer += '\n';
             parseBuffer();
@@ -436,6 +464,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             writeSSE(res, JSON.stringify(errorChunk));
             res.end();
           } else {
+            if (conversation_id) {
+              saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length);
+            }
             const finalChunk = {
               id: chatId,
               object: 'chat.completion.chunk',
@@ -464,10 +495,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         child.stdin.end();
         
       } else {
+        await acquireCodexSlot();
         const child = spawn('codex', args, {
           stdio: ['pipe', 'pipe', 'pipe'],
         });
-        
+
         let buffer = '';
         let fullText = '';
         let promptTokens = 0;
@@ -477,6 +509,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         let responded = false;
         let spawnError = null;
         let timedOut = false;
+        let capturedThreadId = null;
         
         const timeout = setTimeout(() => {
           if (!isClosed) {
@@ -499,11 +532,19 @@ app.post('/v1/chat/completions', async (req, res) => {
             
             try {
               const parsed = JSON.parse(trimmed);
-              
-              if (parsed.type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
-                fullText = parsed.item.text || '';
+
+              if (parsed.type === 'thread.started' && parsed.thread_id) {
+                capturedThreadId = parsed.thread_id;
               }
-              
+
+              if (parsed.type === 'item.completed' && parsed.item && parsed.item.type === 'agent_message') {
+                // 一个回合可能包含多条独立的 agent_message，逐条追加而不是覆盖
+                const text = parsed.item.text || '';
+                if (text) {
+                  fullText = fullText ? fullText + '\n\n' + text : text;
+                }
+              }
+
               if (parsed.type === 'turn.completed' && parsed.usage) {
                 promptTokens = parsed.usage.input_tokens || 0;
                 completionTokens = parsed.usage.output_tokens || 0;
@@ -512,12 +553,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
           }
         }
-        
+
         child.stdout.on('data', (data) => {
           buffer += data.toString();
           parseBuffer();
         });
-        
+
         child.stderr.on('data', (data) => {
           stderr += data.toString();
         });
@@ -526,7 +567,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           spawnError = error;
           stderr += error.message;
         });
-        
+
         let resClosed = false;
         res.on('close', () => {
           resClosed = true;
@@ -534,15 +575,16 @@ app.post('/v1/chat/completions', async (req, res) => {
             child.kill('SIGTERM');
           }
         });
-        
+
         child.stdin.write(prompt);
         child.stdin.end();
-        
+
         child.on('close', (code, signal) => {
           isClosed = true;
           clearTimeout(timeout);
           cleanupTempDir(tempDir);
-          
+          releaseCodexSlot();
+
           if (responded) return;
           responded = true;
           
@@ -565,7 +607,11 @@ app.post('/v1/chat/completions', async (req, res) => {
               },
             });
           }
-          
+
+          if (conversation_id) {
+            saveConversationSession(conversation_id, resumeThreadId || capturedThreadId, messages.length);
+          }
+
           const openAIResponse = {
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
@@ -689,7 +735,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       },
     };
     
-    const proxyReq = http.request(options, (proxyRes) => {
+    const proxyReq = https.request(options, (proxyRes) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
       
