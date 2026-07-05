@@ -6,6 +6,8 @@
 
 - 提供 OpenAI 风格的 `/v1/chat/completions` 接口
 - 支持普通响应和 SSE 流式响应
+- 支持将 Codex 的追问转换成 IDE 原生交互卡片（Trae `AskUserQuestion`、Roo Code `ask_followup_question`）
+- 支持用户选择后的连续追问，并正确接收 `tool` / `tool_result` 结果
 - 支持文本与 base64 图片输入
 - 支持通过 `conversation_id` 续接同一个 codex 会话（基于 `codex exec resume`，只发送增量消息）
 - 限制同时运行的 codex 子进程数量，超出排队等待
@@ -167,6 +169,26 @@ Roo Code 使用 OpenAI Compatible 提供商连接本服务：
 
 当前 Codex CLI 仍在服务端内部执行文件、命令和 MCP 工具，因此 Roo 只负责对话与追问界面，不会接管这些工具的逐项审批。
 
+## Trae 接入
+
+在 Trae 中新增 OpenAI Compatible 模型：
+
+| Trae 配置 | 值 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:3002/v1` |
+| API Key | 任意非空字符串，例如 `local` |
+| Model | `gpt-5.5` |
+
+Trae 会在请求中声明 `AskUserQuestion` 工具，代理会自动读取工具名称和 JSON Schema，无需增加自定义 Header。需要用户确认时，代理把 Codex 生成的追问转换成标准 OpenAI `tool_calls`；Trae 随后显示原生“提问”卡片，包括问题、2～4 个选项和“其他”输入。用户选择后，工具结果会进入下一轮，因此可以继续弹出不同的追问卡片。
+
+该适配不是把 XML 直接显示给用户。内部 `<ask_followup_question>` 只是一种 Codex 输出约定，代理会在返回客户端前将它转换为 Trae 的 `AskUserQuestion`。如果界面直接显示 XML，请先确认运行的是最新代码并重启 LaunchAgent：
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.tangwenjing.codex-cli
+```
+
+交互客户端有一个流式行为差异：为了判断最终结果是普通文本还是提问工具调用，代理会先缓存本轮 Codex 文本，完成后再返回原生 `tool_calls`。因此提问卡片会在本轮结束时整体出现；SSE 心跳仍会持续发送，连接不会因等待而空闲断开。普通、非交互请求仍按消息流式输出。
+
 ## 图片输入
 
 CLI 模式支持 OpenAI 风格的 base64 图片内容：
@@ -250,6 +272,20 @@ launchctl print gui/$(id -u)/com.tangwenjing.codex-cli
 ### 流式请求长时间没有内容
 
 服务已为 SSE 禁用压缩缓冲，并在每次写入后立即刷新，同时定期发送心跳。如果仍然延迟，请检查客户端或反向代理是否缓冲 `text/event-stream` 响应。
+
+Trae 或 Roo Code 请求如果携带交互提问工具，代理需要等 Codex 完成本轮后再判断是否转换成 `tool_calls`，等待期间只有 SSE 心跳，不会逐字显示正文。这属于当前交互转换机制的预期行为。
+
+### Trae 显示 `<ask_followup_question>` XML
+
+正常情况下 Trae 应显示原生“提问”卡片。出现 XML 通常表示服务尚未重启到最新版本，或客户端没有在本轮声明 `AskUserQuestion` 工具。可按以下顺序检查：
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.tangwenjing.codex-cli
+curl http://127.0.0.1:3002/health
+tail -50 /tmp/codex-cli.log
+```
+
+日志中应出现类似 `[interactive-tool] AskUserQuestion ...` 的记录。连续追问允许多次调用该工具，不会因为前一张卡片已经回答而被代理拦截。
 
 ### 服务反复退出，提示 `EADDRINUSE`
 
