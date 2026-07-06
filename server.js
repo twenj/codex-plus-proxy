@@ -796,6 +796,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       let promptTokens = 0;
       let completionTokens = 0;
       let fullText = '';
+      let streamedText = '';
       let timedOut = false;
       const chatId = 'chatcmpl-' + Date.now();
       const createdTime = Math.floor(Date.now() / 1000);
@@ -810,6 +811,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       function sendChunk(content) {
         if (!content || !stream) return;
+        streamedText += content;
         const chunk = {
           id: chatId,
           object: 'chat.completion.chunk',
@@ -904,17 +906,23 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         if (method === 'item/completed' && params.item && params.item.type === 'agentMessage') {
           const text = params.item.text || '';
-          if (text && text.length > fullText.length) {
+          if (text && text.startsWith(fullText)) {
             const remaining = text.slice(fullText.length);
             if (remaining) {
-              fullText = text;
               // 如果没有交互工具，或者交互工具已经回答过，就发送剩余内容
               if (!interactiveClientRequest || interactiveToolAnswered) {
                 sendChunk(remaining);
               }
+              fullText = text;
+            }
+          } else if (text && !fullText.endsWith(text)) {
+            // 一个 turn 可能包含多个 agentMessage。completed 中的 text 只属于当前
+            // item，不能用它覆盖此前 delta 的累计文本。
+            fullText += text;
+            if (!interactiveClientRequest || interactiveToolAnswered) {
+              sendChunk(text);
             }
           }
-          fullText = text;
         }
 
         if (method === 'thread/tokenUsage/updated' && params.tokenUsage) {
@@ -932,7 +940,15 @@ app.post('/v1/chat/completions', async (req, res) => {
       function onServerRequest(id, method, params) {
         if (params.threadId && threadId && params.threadId !== threadId) return;
 
-        if (method.includes('/requestApproval') || method.includes('/approval')) {
+        if (method === 'item/permissions/requestApproval') {
+          // Codex CLI 0.142+ uses a distinct response schema for permission-profile
+          // requests. Echo the requested profile only when this proxy is configured
+          // to auto-approve; otherwise grant no additional permissions for this turn.
+          const permissions = (APPROVAL_POLICY === 'never' || requestSandbox === 'danger-full-access')
+            ? (params.permissions || {})
+            : {};
+          appServer.respond(id, { permissions, scope: 'turn' });
+        } else if (method.includes('/requestApproval') || method.includes('/approval')) {
           if (APPROVAL_POLICY === 'never' || requestSandbox === 'danger-full-access') {
             appServer.respond(id, { decision: 'accept' });
           } else {
@@ -1026,9 +1042,13 @@ app.post('/v1/chat/completions', async (req, res) => {
             ? createClientToolCall(fullText, rooCodeRequest, interactiveTool)
             : null;
 
-          // 如果有交互工具但没有工具调用，发送完整文本（因为之前没有流式发送）
-          if (interactiveClientRequest && !interactiveToolAnswered && !rooToolCall && fullText) {
-            sendChunk(fullText);
+          // 只有确认已发送内容是完整文本前缀时才补发尾部。不能只按字符数切片：
+          // 多个 agentMessage 或 completed 事件会让两者不再指向同一段文本。
+          const remainingText = fullText.startsWith(streamedText)
+            ? fullText.slice(streamedText.length)
+            : (streamedText ? '' : fullText);
+          if (interactiveClientRequest && !interactiveToolAnswered && !rooToolCall && remainingText) {
+            sendChunk(remainingText);
           }
 
           if (rooToolCall) {
