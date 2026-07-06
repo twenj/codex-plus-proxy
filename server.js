@@ -823,19 +823,47 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
 
       let hasToolCall = false; // 追踪是否实际生成了工具调用
+      let xmlBuffer = ''; // 缓冲 XML 内容
+      let possibleXmlStart = false; // 可能正在生成 XML 标签
 
       function onNotification(method, params) {
         if (params.threadId && threadId && params.threadId !== threadId) return;
 
-        // 检测工具调用开始
+        // 检测工具调用开始（真正的 tool call）
         if (method === 'item/toolCall/started') {
           hasToolCall = true;
+          console.log('[TOOL-CALL] Detected tool call via item/toolCall/started');
         }
 
         if (method === 'item/agentMessage/delta' && params.delta) {
           fullText += params.delta;
-          // 只有在实际生成了工具调用时才缓冲，否则立即流式发送
-          const shouldBuffer = hasToolCall && interactiveClientRequest && !interactiveToolAnswered;
+          xmlBuffer += params.delta;
+          
+          // 检测 XML 工具调用标签（如果有交互工具且还没检测到工具调用）
+          if (interactiveClientRequest && !hasToolCall && !interactiveToolAnswered) {
+            // 如果看到 '<' 字符，标记可能正在生成 XML
+            if (params.delta.includes('<')) {
+              possibleXmlStart = true;
+            }
+            
+            // 检测任何 XML 标签的开始，如 <ask_followup_question>, <tool_call> 等
+            if (/<[a-z_]+[>\s]/.test(xmlBuffer)) {
+              hasToolCall = true;
+              possibleXmlStart = false;
+              console.log(`[TOOL-CALL] Detected XML tool call in buffer: ${xmlBuffer.slice(0, 50)}...`);
+            }
+            
+            // 如果缓冲区很长但还没检测到完整的 XML 标签，说明不是 XML（误判），发送缓冲
+            if (possibleXmlStart && xmlBuffer.length > 100 && !hasToolCall) {
+              possibleXmlStart = false;
+              sendChunk(xmlBuffer);
+              xmlBuffer = '';
+              return;
+            }
+          }
+          
+          // 只有在实际生成了工具调用或可能正在生成 XML 时才缓冲，否则立即流式发送
+          const shouldBuffer = (hasToolCall || possibleXmlStart) && interactiveClientRequest && !interactiveToolAnswered;
           if (!shouldBuffer) {
             sendChunk(params.delta);
           }
