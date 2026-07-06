@@ -822,14 +822,21 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
 
+      let hasToolCall = false; // 追踪是否实际生成了工具调用
+
       function onNotification(method, params) {
         if (params.threadId && threadId && params.threadId !== threadId) return;
 
+        // 检测工具调用开始
+        if (method === 'item/toolCall/started') {
+          hasToolCall = true;
+        }
+
         if (method === 'item/agentMessage/delta' && params.delta) {
           fullText += params.delta;
-          // 如果没有交互工具，或者交互工具已经回答过，就立即流式发送
-          // 否则等待完整内容，以便正确解析工具调用
-          if (!interactiveClientRequest || interactiveToolAnswered) {
+          // 只有在实际生成了工具调用时才缓冲，否则立即流式发送
+          const shouldBuffer = hasToolCall && interactiveClientRequest && !interactiveToolAnswered;
+          if (!shouldBuffer) {
             sendChunk(params.delta);
           }
         }
