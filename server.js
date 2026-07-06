@@ -26,13 +26,23 @@ const CODEX_WORKDIR = process.env.CODEX_WORKDIR || '';
 const PROCESS_TIMEOUT = parseInt(process.env.PROCESS_TIMEOUT) || 600000;
 const SSE_HEARTBEAT_INTERVAL = parseInt(process.env.SSE_HEARTBEAT_INTERVAL) || 15000;
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 3;
-const PROXY_BROWSER_CONFIG = [];
+const CODEX_LEAN_MODE = process.env.CODEX_LEAN_MODE === 'true';
+const DEFAULT_REASONING_EFFORT = process.env.DEFAULT_REASONING_EFFORT || '';
+const PROXY_BROWSER_CONFIG = CODEX_LEAN_MODE
+  ? [
+      '--disable', 'plugins',
+      '--disable', 'browser_use',
+      '-c', 'mcp_servers.node_repl.enabled=false',
+      '-c', 'mcp_servers.playwright.enabled=false',
+    ]
+  : [];
 const APPROVAL_POLICY = process.env.APPROVAL_POLICY || 'never';
 
 // XML 检测配置
 const XML_BUFFER_MAX_LENGTH = 100; // XML 标签检测前的最大缓冲长度
 const XML_BUFFER_ABSOLUTE_MAX = 10000; // XML 缓冲区绝对最大长度，防止内存溢出
 const XML_TAG_PATTERN = /<[a-z][a-z0-9_]*[\s/>]/i; // 检测 XML 标签的正则表达式
+const MAX_STDERR_BUFFER = 64 * 1024;
 
 // 日志配置
 const DEBUG_MODE = process.env.DEBUG === 'true';
@@ -57,12 +67,17 @@ class AppServerClient extends EventEmitter {
     this.initialized = false;
     this.initPromise = null;
     this.stderr = '';
-    this.activeTurns = new Set();
   }
 
   async start() {
     if (this.initPromise) return this.initPromise;
-    this.initPromise = this._doInit();
+    this.initPromise = this._doInit().catch((err) => {
+      this.initialized = false;
+      this.initPromise = null;
+      if (this.child && !this.child.killed) this.child.kill('SIGTERM');
+      this.child = null;
+      throw err;
+    });
     return this.initPromise;
   }
 
@@ -117,6 +132,9 @@ class AppServerClient extends EventEmitter {
 
     this.child.stderr.on('data', (data) => {
       this.stderr += data.toString();
+      if (this.stderr.length > MAX_STDERR_BUFFER) {
+        this.stderr = this.stderr.slice(-MAX_STDERR_BUFFER);
+      }
     });
 
     this.child.on('error', (err) => {
@@ -206,9 +224,10 @@ class AppServerClient extends EventEmitter {
     return result.thread;
   }
 
-  async turnStart({ threadId, input, model }) {
+  async turnStart({ threadId, input, model, effort }) {
     const params = { threadId, input };
     if (model) params.model = model;
+    if (effort) params.effort = effort;
     const result = await this.request('turn/start', params);
     return result.turn;
   }
@@ -291,12 +310,24 @@ function startSSEHeartbeat(res) {
 let activeCodexProcesses = 0;
 const codexWaitQueue = [];
 
-function acquireCodexSlot() {
+function acquireCodexSlot(req) {
   if (activeCodexProcesses < MAX_CONCURRENT_REQUESTS) {
     activeCodexProcesses++;
     return Promise.resolve();
   }
-  return new Promise(resolve => codexWaitQueue.push(resolve));
+  return new Promise((resolve, reject) => {
+    const entry = { resolve, reject };
+    const onAborted = () => {
+      const index = codexWaitQueue.indexOf(entry);
+      if (index !== -1) {
+        codexWaitQueue.splice(index, 1);
+        reject(new Error('Client disconnected while waiting for an available Codex slot'));
+      }
+    };
+    entry.onDequeued = () => req.removeListener('aborted', onAborted);
+    req.once('aborted', onAborted);
+    codexWaitQueue.push(entry);
+  });
 }
 
 function releaseCodexSlot() {
@@ -304,7 +335,8 @@ function releaseCodexSlot() {
   const next = codexWaitQueue.shift();
   if (next) {
     activeCodexProcesses++;
-    next();
+    next.onDequeued();
+    next.resolve();
   }
 }
 
@@ -559,48 +591,6 @@ function hasAnsweredInteractiveTool(messages, interactiveTool) {
   });
 }
 
-function buildPrompt(messages, images) {
-  let prompt = '';
-  let imageIndex = 0;
-
-  for (const msg of messages) {
-    if (msg.role === 'system') {
-      continue;
-    }
-
-    const textContent = contentToString(msg.content);
-    let msgContent = textContent;
-
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      const imageParts = msg.content.filter(p => p.type === 'image_url');
-      if (imageParts.length > 0) {
-        const imgDescs = [];
-        for (let i = 0; i < imageParts.length; i++) {
-          const img = images[imageIndex];
-          if (img) {
-            imgDescs.push(`[图片 ${imageIndex + 1}: 请读取文件 ${img.path}]`);
-            imageIndex++;
-          }
-        }
-        if (imgDescs.length > 0) {
-          msgContent = imgDescs.join('\n') + '\n\n' + textContent;
-        }
-      }
-    }
-
-    if (msg.role === 'user') {
-      prompt += `Human: ${msgContent}\n\n`;
-    } else if (msg.role === 'assistant') {
-      prompt += `Assistant: ${msgContent}\n\n`;
-    } else if (msg.role === 'tool') {
-      prompt += `Human: Tool result${msg.name ? ` (${msg.name})` : ''}: ${msgContent}\n\n`;
-    }
-  }
-
-  prompt += 'Assistant: ';
-  return prompt;
-}
-
 function messagesToAppServerInput(messages, images, userOnly = false) {
   const input = [];
   let imageIndex = 0;
@@ -610,29 +600,20 @@ function messagesToAppServerInput(messages, images, userOnly = false) {
     if (userOnly && msg.role !== 'user') continue;
 
     const textContent = contentToString(msg.content);
-    let msgText = textContent;
 
     if (msg.role === 'user' && Array.isArray(msg.content)) {
-      const imageParts = msg.content.filter(p => p.type === 'image_url');
-      if (imageParts.length > 0) {
-        const imgDescs = [];
-        for (let i = 0; i < imageParts.length; i++) {
-          const img = images[imageIndex];
-          if (img) {
-            imgDescs.push(`[图片 ${imageIndex + 1}: ${img.description || '用户上传的图片'}]`);
-            imageIndex++;
-          }
-        }
-        if (imgDescs.length > 0) {
-          msgText = msgText + '\n\n' + imgDescs.join('\n');
+      for (const part of msg.content) {
+        if (part.type === 'text' && typeof part.text === 'string') {
+          input.push({ type: 'text', text: part.text });
+        } else if (part.type === 'image_url') {
+          const img = images[imageIndex++];
+          if (img) input.push({ type: 'localImage', path: img.path });
         }
       }
-    }
-
-    if (msg.role === 'user') {
-      input.push({ type: 'text', text: msgText });
+    } else if (msg.role === 'user') {
+      input.push({ type: 'text', text: textContent });
     } else if (msg.role === 'tool') {
-      input.push({ type: 'text', text: `Tool result${msg.name ? ` (${msg.name})` : ''}: ${msgText}` });
+      input.push({ type: 'text', text: `Tool result${msg.name ? ` (${msg.name})` : ''}: ${textContent}` });
     }
   }
 
@@ -662,10 +643,8 @@ function extractAndSaveImages(messages) {
             }
           }
 
-          if (imagePath) {
-            images.push({ path: imagePath, index: imageIndex });
-            imageIndex++;
-          }
+          images.push(imagePath ? { path: imagePath, index: imageIndex } : null);
+          imageIndex++;
         }
       }
     }
@@ -728,7 +707,18 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { messages, model, stream = true, temperature, max_tokens, tools, conversation_id, sandbox, workdir } = req.body;
+    const {
+      messages,
+      model,
+      stream = true,
+      temperature,
+      max_tokens,
+      reasoning_effort,
+      tools,
+      conversation_id,
+      sandbox,
+      workdir,
+    } = req.body;
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
@@ -740,6 +730,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const cliModel = mapModel(model);
+    const reasoningEffort = reasoning_effort || DEFAULT_REASONING_EFFORT;
     const rooCodeRequest = isRooCodeRequest(req, messages, tools);
     const interactiveTool = findInteractiveTool(tools);
     const interactiveClientRequest = rooCodeRequest || Boolean(interactiveTool);
@@ -788,13 +779,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { images, tempDir } = extractAndSaveImages(promptMessages);
 
     if (USE_CLI && appServer) {
-      await appServer.start();
-      await acquireCodexSlot();
+      try {
+        await appServer.start();
+        await acquireCodexSlot(req);
+      } catch (err) {
+        cleanupTempDir(tempDir);
+        throw err;
+      }
 
       let threadId = null;
       let turnCompleted = false;
       let promptTokens = 0;
       let completionTokens = 0;
+      let cachedPromptTokens = 0;
+      let reasoningTokens = 0;
       let fullText = '';
       let streamedText = '';
       let timedOut = false;
@@ -929,6 +927,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           const usage = params.tokenUsage.last || params.tokenUsage.total || {};
           promptTokens = usage.inputTokens || 0;
           completionTokens = usage.outputTokens || 0;
+          cachedPromptTokens = usage.cachedInputTokens || 0;
+          reasoningTokens = usage.reasoningOutputTokens || 0;
         }
 
         if (method === 'turn/completed') {
@@ -958,9 +958,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           try { appServer.respond(id, {}); } catch (e) {}
         }
       }
-
-      appServer.on('notification', onNotification);
-      appServer.on('serverRequest', onServerRequest);
 
       const waitForTurn = () => new Promise((resolve) => {
         resolveTurn = resolve;
@@ -1004,6 +1001,10 @@ app.post('/v1/chat/completions', async (req, res) => {
             threadId = thread.id;
           }
 
+          // threadId 必须先确定，避免并发请求在启动窗口接收其他线程的事件。
+          appServer.on('notification', onNotification);
+          appServer.on('serverRequest', onServerRequest);
+
           let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
           if (interactiveClientRequest) {
             systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
@@ -1016,9 +1017,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           const userInput = messagesToAppServerInput(promptMessages, images, !!resumeThreadId);
           input.push(...userInput);
 
-          await appServer.turnStart({ threadId, input, model: cliModel });
-
-          await waitForTurn();
+          // 先安装完成回调，避免极短 turn 在 turn/start 返回前已经 completed。
+          const turnCompletion = waitForTurn();
+          await appServer.turnStart({ threadId, input, model: cliModel, effort: reasoningEffort });
+          await turnCompletion;
 
           if (res.writableEnded) return;
 
@@ -1081,6 +1083,8 @@ app.post('/v1/chat/completions', async (req, res) => {
               prompt_tokens: promptTokens,
               completion_tokens: completionTokens,
               total_tokens: promptTokens + completionTokens,
+              prompt_tokens_details: { cached_tokens: cachedPromptTokens },
+              completion_tokens_details: { reasoning_tokens: reasoningTokens },
             },
           };
           writeSSE(res, JSON.stringify(finalChunk));
@@ -1121,6 +1125,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             threadId = thread.id;
           }
 
+          appServer.on('notification', onNotification);
+          appServer.on('serverRequest', onServerRequest);
+
           let systemPrompt = promptMessages.filter(m => m.role === 'system').map(m => contentToString(m.content)).join('\n\n');
           if (interactiveClientRequest) {
             systemPrompt = [systemPrompt, CLIENT_INTERACTION_PROMPT].filter(Boolean).join('\n\n');
@@ -1133,9 +1140,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           const userInput = messagesToAppServerInput(promptMessages, images, !!resumeThreadId);
           input.push(...userInput);
 
-          await appServer.turnStart({ threadId, input, model: cliModel });
-
-          await waitForTurn();
+          const turnCompletion = waitForTurn();
+          await appServer.turnStart({ threadId, input, model: cliModel, effort: reasoningEffort });
+          await turnCompletion;
 
           if (timedOut) {
             return res.status(500).json({
@@ -1174,6 +1181,8 @@ app.post('/v1/chat/completions', async (req, res) => {
               prompt_tokens: promptTokens,
               completion_tokens: completionTokens,
               total_tokens: promptTokens + completionTokens,
+              prompt_tokens_details: { cached_tokens: cachedPromptTokens },
+              completion_tokens_details: { reasoning_tokens: reasoningTokens },
             },
           };
 
@@ -1338,30 +1347,42 @@ app.get('/health', (req, res) => {
     sandbox: CODEX_SANDBOX,
     workdir: CODEX_WORKDIR || process.cwd(),
     app_server: USE_APP_SERVER && appServer ? appServer.initialized : false,
+    lean_mode: CODEX_LEAN_MODE,
+    default_reasoning_effort: DEFAULT_REASONING_EFFORT || null,
     active_processes: activeCodexProcesses,
     queued_requests: codexWaitQueue.length,
   });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Codex proxy server running on http://localhost:${PORT}`);
-  console.log(`Default model: ${DEFAULT_MODEL}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  if (USE_APP_SERVER && appServer) {
-    console.log('App Server mode: enabled (lazy initialized on first request)');
-  }
-});
+function startHttpServer() {
+  const server = app.listen(PORT, () => {
+    console.log(`Codex proxy server running on http://localhost:${PORT}`);
+    console.log(`Default model: ${DEFAULT_MODEL}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+    if (USE_APP_SERVER && appServer) {
+      console.log('App Server mode: enabled (lazy initialized on first request)');
+    }
+  });
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down...');
-  if (appServer) appServer.shutdown();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10000);
-});
+  const shutdown = signal => {
+    console.log(`${signal} received, shutting down...`);
+    if (appServer) appServer.shutdown();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  return server;
+}
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down...');
-  if (appServer) appServer.shutdown();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10000);
-});
+if (require.main === module) {
+  startHttpServer();
+}
+
+module.exports = {
+  AppServerClient,
+  cleanupTempDir,
+  extractAndSaveImages,
+  messagesToAppServerInput,
+  startHttpServer,
+};

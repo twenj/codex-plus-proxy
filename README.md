@@ -57,6 +57,8 @@ npm run dev
 | `CODEX_SANDBOX` | `danger-full-access` | Codex 默认沙箱模式 |
 | `CODEX_WORKDIR` | 空 | Codex 默认工作目录 |
 | `MAX_CONCURRENT_REQUESTS` | `3` | 同时运行的 codex 子进程上限，超出的请求排队等待 |
+| `CODEX_LEAN_MODE` | `false` | 精简代理实例：禁用插件、Browser Use、node_repl 与 Playwright MCP，降低固定工具上下文；需要浏览器或文档插件时不要开启 |
+| `DEFAULT_REASONING_EFFORT` | 空 | 默认推理强度，例如 `low`、`medium`、`high`；留空时沿用 Codex 配置 |
 
 至少需要满足以下条件之一，否则服务会拒绝启动：
 
@@ -138,6 +140,7 @@ curl -N http://localhost:3002/v1/chat/completions \
 | `conversation_id` | 会话标识；相同标识会使用 App Server 的 `thread/resume` 续接上一次的会话 |
 | `sandbox` | 覆盖本次请求的沙箱模式 |
 | `workdir` | 覆盖本次请求的工作目录 |
+| `reasoning_effort` | 覆盖本次请求的推理强度；简单任务使用 `low` 可减少 reasoning token |
 
 也可以通过请求头传入：
 
