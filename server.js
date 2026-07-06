@@ -29,6 +29,14 @@ const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) ||
 const PROXY_BROWSER_CONFIG = [];
 const APPROVAL_POLICY = process.env.APPROVAL_POLICY || 'never';
 
+// XML 检测配置
+const XML_BUFFER_MAX_LENGTH = 100; // XML 标签检测前的最大缓冲长度
+const XML_BUFFER_ABSOLUTE_MAX = 10000; // XML 缓冲区绝对最大长度，防止内存溢出
+const XML_TAG_PATTERN = /<[a-z][a-z0-9_]*[\s/>]/i; // 检测 XML 标签的正则表达式
+
+// 日志配置
+const DEBUG_MODE = process.env.DEBUG === 'true';
+
 if (!SANDBOX_MODES.includes(CODEX_SANDBOX)) {
   console.error(`Error: CODEX_SANDBOX must be one of: ${SANDBOX_MODES.join(', ')}`);
   process.exit(1);
@@ -736,7 +744,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const interactiveTool = findInteractiveTool(tools);
     const interactiveClientRequest = rooCodeRequest || Boolean(interactiveTool);
     const interactiveToolAnswered = hasAnsweredInteractiveTool(messages, interactiveTool);
-    if (interactiveTool) {
+    if (DEBUG_MODE && interactiveTool) {
       const toolName = interactiveTool?.function?.name || interactiveTool?.name;
       console.log(`[interactive-tool] ${toolName} answered=${interactiveToolAnswered}`);
     }
@@ -826,13 +834,50 @@ app.post('/v1/chat/completions', async (req, res) => {
       let xmlBuffer = ''; // 缓冲 XML 内容
       let possibleXmlStart = false; // 可能正在生成 XML 标签
 
+      // 检测 XML 工具调用标签
+      function detectXmlToolCall() {
+        if (!interactiveClientRequest || hasToolCall || interactiveToolAnswered) {
+          return false;
+        }
+
+        // 防止缓冲区无限增长
+        if (xmlBuffer.length > XML_BUFFER_ABSOLUTE_MAX) {
+          console.warn(`[XML-DETECT] Buffer exceeded max size (${XML_BUFFER_ABSOLUTE_MAX}), resetting`);
+          xmlBuffer = xmlBuffer.slice(-XML_BUFFER_MAX_LENGTH);
+          possibleXmlStart = false;
+          return false;
+        }
+
+        // 检测 XML 标签
+        if (XML_TAG_PATTERN.test(xmlBuffer)) {
+          hasToolCall = true;
+          possibleXmlStart = false;
+          if (DEBUG_MODE) {
+            console.log(`[TOOL-CALL] Detected XML tool call: ${xmlBuffer.slice(0, 50)}...`);
+          }
+          return true;
+        }
+
+        // 如果缓冲区很长但还没检测到完整的 XML 标签，说明不是 XML（误判）
+        if (possibleXmlStart && xmlBuffer.length > XML_BUFFER_MAX_LENGTH) {
+          possibleXmlStart = false;
+          sendChunk(xmlBuffer);
+          xmlBuffer = '';
+          return false;
+        }
+
+        return false;
+      }
+
       function onNotification(method, params) {
         if (params.threadId && threadId && params.threadId !== threadId) return;
 
         // 检测工具调用开始（真正的 tool call）
         if (method === 'item/toolCall/started') {
           hasToolCall = true;
-          console.log('[TOOL-CALL] Detected tool call via item/toolCall/started');
+          if (DEBUG_MODE) {
+            console.log('[TOOL-CALL] Detected via item/toolCall/started');
+          }
         }
 
         if (method === 'item/agentMessage/delta' && params.delta) {
@@ -846,20 +891,8 @@ app.post('/v1/chat/completions', async (req, res) => {
               possibleXmlStart = true;
             }
             
-            // 检测任何 XML 标签的开始，如 <ask_followup_question>, <tool_call> 等
-            if (/<[a-z_]+[>\s]/.test(xmlBuffer)) {
-              hasToolCall = true;
-              possibleXmlStart = false;
-              console.log(`[TOOL-CALL] Detected XML tool call in buffer: ${xmlBuffer.slice(0, 50)}...`);
-            }
-            
-            // 如果缓冲区很长但还没检测到完整的 XML 标签，说明不是 XML（误判），发送缓冲
-            if (possibleXmlStart && xmlBuffer.length > 100 && !hasToolCall) {
-              possibleXmlStart = false;
-              sendChunk(xmlBuffer);
-              xmlBuffer = '';
-              return;
-            }
+            // 执行 XML 检测
+            detectXmlToolCall();
           }
           
           // 只有在实际生成了工具调用或可能正在生成 XML 时才缓冲，否则立即流式发送
